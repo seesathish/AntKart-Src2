@@ -362,9 +362,95 @@ cd aks && terragrunt destroy && cd ..
 # networking and RG stay (they're free)
 ```
 
+> **Side observation:** The resource group survives the networking destroy because it lives in a separate module with its own state. But even if you tried running `terragrunt destroy` from the resource group module directory, Terraform would refuse — see "When Terraform Refuses" just ahead for why that refusal is the right design.
+
 ---
 
-### Step 1.6 — Seeing Terraform's Memory — Inspecting Remote State
+### Step 1.6 — When Terraform Refuses — The `prevent_destroy` Guardrail
+
+If you tried running `terragrunt destroy` from the resource group module directory, Terraform refused with this error:
+
+```
+Error: Instance cannot be destroyed
+
+  on main.tf line 56, in resource "azurerm_resource_group" "this":
+  56: resource "azurerm_resource_group" "this" {
+
+Resource azurerm_resource_group.this has lifecycle.prevent_destroy set, but
+the plan calls for this resource to be destroyed.
+```
+
+This is not a bug. It's a deliberate safety net.
+
+**What's causing it**
+
+Open [infrastructure/modules/resource-group/main.tf](infrastructure/modules/resource-group/main.tf). Near the bottom of the resource block:
+
+```hcl
+resource "azurerm_resource_group" "this" {
+  name     = var.name
+  location = var.location
+  tags     = merge(local.default_tags, var.tags)
+
+  lifecycle {
+    prevent_destroy = true   # <-- the guardrail
+  }
+}
+```
+
+The `lifecycle` block tells Terraform: "If any plan would destroy this resource — through any command, any script, any pipeline — refuse and error out." It doesn't matter who runs it or what flags they pass. The protection is baked into the module itself.
+
+**Why the resource group specifically**
+
+A resource group in Azure is a container. Destroying it destroys *every resource inside it*. Once AKS, Cosmos DB, Service Bus, Key Vault, and your databases all live inside `rg-antkart-dev-eastus`, a single accidental `terragrunt destroy` from the wrong directory would wipe the entire environment — including all data — in under five minutes. The `prevent_destroy` flag makes that mistake impossible without an explicit, deliberate code change.
+
+**Which resources should have this guardrail**
+
+| Resource | Guardrail? | Why |
+|----------|-----------|-----|
+| Resource group | Yes | Destroys all child resources — catastrophic blast radius |
+| Key Vault | Yes | Has soft-delete + purge protection; rebuilding loses key history |
+| Cosmos DB | Yes | Contains business data |
+| Storage account (with data) | Yes | Data loss |
+| Production AKS | Yes | Rebuilds take time; node IPs and identities change |
+| Virtual Network | Optional | Free to rebuild, but breaks all dependent peerings |
+| NSG | No | Pure configuration — disposable and instant to recreate |
+| ACR | Optional | Depends on whether you want to retain pushed images |
+| Log Analytics Workspace | Yes in prod | Historical telemetry lives here |
+
+**How to genuinely destroy a protected resource**
+
+If you ever truly need to destroy something with `prevent_destroy = true`, the process is intentionally awkward:
+
+1. Open the module's `main.tf` and comment out the `prevent_destroy` line:
+   ```hcl
+   lifecycle {
+     # prevent_destroy = true   ← commented out
+   }
+   ```
+2. Run `terragrunt apply` — this changes nothing in Azure, but it updates Terraform's state so it now knows the protection is gone.
+3. Run `terragrunt destroy` — now permitted.
+4. Restore `prevent_destroy = true` and re-apply if the resource will be recreated.
+
+Step 2 is not optional. If you skip it and go straight to destroy, Terraform may still refuse because it reads the lifecycle flag from its cache. You must apply the change first.
+
+This ceremony exists so you can't destroy accidentally. In a PR-based workflow, removing a `prevent_destroy = true` line appears as a code diff — one that should trigger a review comment: *"Why are we removing this protection? What's the rollback plan?"*
+
+**What this means for the destroy/recreate cycle**
+
+The cycle you practiced in Step 1.5 is designed for "low-stakes, free, easily rebuilt" resources — perfect for networking (VNet, subnets, NSGs cost nothing and rebuild in 90 seconds). It is **not** designed for resource groups, Key Vaults, or anything holding data.
+
+The `prevent_destroy` guardrail on the resource group is the system separating "safe to destroy routinely" from "only destroy with a deliberate decision." Networking lives on one side of that boundary. The resource group lives on the other.
+
+**The architect mindset**
+
+As you design each new module, ask one question for every resource: "What's the cost of accidentally destroying this?" If the answer is *data loss* or *hours of rebuild work*, add `prevent_destroy = true`. If the answer is *30 seconds and zero dollars*, leave it disposable. That single judgment call is one of the most consequential decisions in IaC design.
+
+> **Optional — check the pattern as we build:** Browse through `infrastructure/modules/` as each new module is added (ACR, Key Vault, Cosmos DB, AKS). Notice which ones include `prevent_destroy` and which don't. The pattern should match the table above. If you ever spot a mismatch — say, Key Vault without the guardrail — that's a security review finding worth flagging before any production deployment.
+
+---
+
+### Step 1.7 — Seeing Terraform's Memory — Inspecting Remote State
 
 Terraform's state file is the JSON document that records everything it created. It lives in Azure Blob Storage at `stantkarttfstate2026/tfstate/environments/dev/resource-group/terraform.tfstate`. You can inspect it without downloading it:
 
@@ -448,7 +534,7 @@ Key fields to understand:
 
 ---
 
-### Step 1.7 — Try these experiments
+### Step 1.8 — Try these experiments
 
 **Experiment 1 — In-place update (the `~` symbol)**
 
@@ -521,7 +607,7 @@ Now check the VNet ID:
 terragrunt state show azurerm_virtual_network.this
 ```
 
-Compare the `id` field to what you saw in Step 1.6. You'll see it has changed:
+Compare the `id` field to what you saw in Step 1.7. You'll see it has changed:
 ```
 # Before destroy/recreate:
 id = "/subscriptions/.../virtualNetworks/vnet-antkart-dev"
@@ -575,7 +661,7 @@ The `# forces replacement` note explains why. Changing a VNet's address space re
 
 ---
 
-### Step 1.8 — Troubleshooting
+### Step 1.9 — Troubleshooting
 
 | Problem | Symptoms | Fix |
 |---------|----------|-----|
