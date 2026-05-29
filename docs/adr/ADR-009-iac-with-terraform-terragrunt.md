@@ -55,6 +55,31 @@ Each `environments/{env}/{module}/terragrunt.hcl` file:
 - Points at the module source
 - Passes environment-specific inputs
 
+### Root config filename
+
+We name the root Terragrunt configuration file `root.hcl`, not `terragrunt.hcl`.
+
+Newer versions of Terragrunt emit a deprecation warning when the root config is named `terragrunt.hcl`:
+
+> "Using terragrunt.hcl as the root of Terragrunt configurations is an anti-pattern, and no longer recommended."
+
+The `root.hcl` convention removes the ambiguity between the two roles a `.hcl` file can play:
+
+| File | Role |
+|------|------|
+| `infrastructure/root.hcl` | One file, shared by all modules — backend + provider config |
+| `environments/{env}/{module}/terragrunt.hcl` | Per-module file — wires a specific module to an environment |
+
+Because `find_in_parent_folders()` with no argument defaults to searching for `"terragrunt.hcl"`, child modules must pass the filename explicitly:
+
+```hcl
+include "root" {
+  path = find_in_parent_folders("root.hcl")
+}
+```
+
+Without the explicit argument, `find_in_parent_folders()` would match the nearest per-module `terragrunt.hcl` instead of the root config — a subtle bug that would only surface when running from a nested module directory.
+
 ### Remote state
 
 Terraform state is stored in Azure Blob Storage (`stantkarttfstate2026` / container `tfstate`). Each module gets its own state key derived from its folder path via `path_relative_to_include()`. State locking uses Azure Blob Storage's native lease mechanism.

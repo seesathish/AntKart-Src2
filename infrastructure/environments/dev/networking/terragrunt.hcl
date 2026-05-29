@@ -21,8 +21,14 @@
 #     terragrunt run-all apply  ← Terragrunt figures out order from dependencies
 # =============================================================================
 
+# We pass "root.hcl" explicitly because find_in_parent_folders() defaults to
+# searching for "terragrunt.hcl", but our root config is named "root.hcl"
+# following the modern Terragrunt convention (using "terragrunt.hcl" as the
+# root is deprecated). Without the explicit argument, find_in_parent_folders()
+# would match the nearest per-module terragrunt.hcl — not this root config.
+# See ADR-009 for the full naming rationale.
 include "root" {
-  path = find_in_parent_folders()
+  path = find_in_parent_folders("root.hcl")
 }
 
 include "env" {

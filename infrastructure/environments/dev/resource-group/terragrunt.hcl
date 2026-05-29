@@ -28,11 +28,17 @@
 # -----------------------------------------------------------------------------
 # INCLUDE ROOT — Inherit backend and provider configuration
 #
-# find_in_parent_folders() walks up the directory tree looking for a file
-# named terragrunt.hcl. Starting from this file's directory:
+# We pass "root.hcl" explicitly because find_in_parent_folders() defaults to
+# searching for "terragrunt.hcl", but our root config is named "root.hcl"
+# following the modern Terragrunt convention (using "terragrunt.hcl" as the
+# root is deprecated). Without the explicit argument, find_in_parent_folders()
+# would match the nearest per-module terragrunt.hcl — not this root config.
+# See ADR-009 for the full naming rationale.
+#
+# find_in_parent_folders("root.hcl") walks up the directory tree:
 #   environments/dev/resource-group/ → environments/dev/ → environments/ → infrastructure/
 #
-# It finds infrastructure/terragrunt.hcl which contains:
+# It finds infrastructure/root.hcl which contains:
 #   - The azurerm remote backend pointing to Azure Blob Storage
 #   - The generate "provider" block that creates provider.tf
 #
@@ -40,7 +46,7 @@
 # generate blocks are merged into this module's config.
 # -----------------------------------------------------------------------------
 include "root" {
-  path = find_in_parent_folders()
+  path = find_in_parent_folders("root.hcl")
 }
 
 # -----------------------------------------------------------------------------

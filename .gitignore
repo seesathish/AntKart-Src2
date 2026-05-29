@@ -366,3 +366,6 @@ docker-compose.gmail.yml
 
 # Structurizr CLI local cache (Lucene index + thumbnails — generated tooling state)
 docs/architecture/.structurizr/
+
+# Terragrunt generated cache and lock files
+.terragrunt-cache/

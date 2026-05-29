@@ -287,9 +287,172 @@ If everything looks right — you've just provisioned real Azure infrastructure 
 
 ---
 
-### Step 1.5 — Try this experiment
+### Step 1.5 — The Destroy/Recreate Cycle — Your Cost-Control Superpower
 
-This exercise teaches you how Terraform detects and handles change.
+This is the most important habit you'll build on this platform.
+
+**Why it matters:**
+When we add AKS in Section 3, the cluster will cost roughly **$5 per day** in Azure compute charges — even when you're not using it. Networking resources (VNet, subnets, NSGs) are **free**. The resource group itself is free.
+
+The professional habit is: **destroy AKS at the end of every work session. Recreate it at the start of the next one.**
+
+Terraform makes this safe because it has perfect memory. After a destroy, running `apply` again rebuilds everything identically from the code. You're not losing any configuration — just releasing the hourly compute charge.
+
+**Practice the cycle now with networking (zero cost, zero risk):**
+
+```powershell
+# Step 1: Confirm what you have
+cd infrastructure/environments/dev/networking
+terragrunt state list
+```
+
+Expected output:
+```
+azurerm_network_security_group.aks
+azurerm_network_security_group.pe
+azurerm_subnet.aks
+azurerm_subnet.appgw
+azurerm_subnet.pe
+azurerm_subnet_network_security_group_association.aks
+azurerm_subnet_network_security_group_association.pe
+azurerm_virtual_network.this
+```
+
+```powershell
+# Step 2: Destroy the networking resources
+terragrunt destroy
+```
+
+Terraform will show a plan listing all 8 resources to be destroyed. Type `yes` when prompted.
+
+Expected output:
+```
+azurerm_subnet_network_security_group_association.aks: Destroying...
+azurerm_subnet_network_security_group_association.pe: Destroying...
+azurerm_subnet.aks: Destroying...
+azurerm_subnet.pe: Destroying...
+azurerm_subnet.appgw: Destroying...
+azurerm_network_security_group.aks: Destroying...
+azurerm_network_security_group.pe: Destroying...
+azurerm_virtual_network.this: Destroying...
+
+Destroy complete! Resources: 8 destroyed.
+```
+
+Go to the Azure Portal — the VNet and NSGs are gone from the resource group. The resource group itself is still there (protected by `prevent_destroy = true`).
+
+```powershell
+# Step 3: Recreate from code
+terragrunt apply
+```
+
+Eight resources are recreated in about 90 seconds. The VNet, subnets, and NSG rules are identical to what existed before — all driven from the same code.
+
+> **What this teaches:**
+> Infrastructure created by code is **disposable and reproducible**. You can tear it down and rebuild it with confidence because the source of truth is the `.tf` files in Git, not the live resources in Azure. This is fundamentally different from manually-created infrastructure, where destroying something means losing knowledge of how to recreate it.
+
+**The cost-control workflow for Section 3+ (when AKS is running):**
+```powershell
+# Start of work session — bring everything up
+cd infrastructure/environments/dev
+terragrunt run-all apply
+
+# End of work session — destroy only the expensive bits
+cd aks && terragrunt destroy && cd ..
+# networking and RG stay (they're free)
+```
+
+---
+
+### Step 1.6 — Seeing Terraform's Memory — Inspecting Remote State
+
+Terraform's state file is the JSON document that records everything it created. It lives in Azure Blob Storage at `stantkarttfstate2026/tfstate/environments/dev/resource-group/terraform.tfstate`. You can inspect it without downloading it:
+
+```powershell
+cd infrastructure/environments/dev/resource-group
+
+# List all resources Terraform is tracking
+terragrunt state list
+```
+
+Expected output:
+```
+azurerm_resource_group.this
+```
+
+```powershell
+# Show all recorded attributes of the resource group
+terragrunt state show azurerm_resource_group.this
+```
+
+Expected output (abbreviated):
+```
+# azurerm_resource_group.this:
+resource "azurerm_resource_group" "this" {
+    id       = "/subscriptions/1a69c45b-82ed-4ec6-972e-c9a5933e6fd0/resourceGroups/rg-antkart-dev-eastus"
+    location = "eastus"
+    name     = "rg-antkart-dev-eastus"
+    tags     = {
+        "environment" = "dev"
+        "managed_by"  = "terraform"
+        "owner"       = "sathish"
+        "project"     = "antkart"
+    }
+}
+```
+
+This is Terraform's snapshot of the resource. When you run `plan`, Terraform compares this snapshot against your `.tf` files and against the live Azure state. A three-way diff:
+- **Code vs state** → what you want to change
+- **State vs live** → whether someone changed Azure outside of Terraform (drift)
+
+**Look at the state file directly:**
+
+You can download and inspect the raw JSON from the Azure Portal:
+1. Go to Storage Accounts → `stantkarttfstate2026` → Containers → `tfstate`
+2. Navigate to `environments/dev/resource-group/terraform.tfstate`
+3. Click the file → Download
+
+The JSON contains:
+```json
+{
+  "version": 4,
+  "terraform_version": "1.x.x",
+  "serial": 3,
+  "lineage": "a1b2c3d4-...",
+  "resources": [
+    {
+      "type": "azurerm_resource_group",
+      "name": "this",
+      "instances": [
+        {
+          "attributes": {
+            "id": "/subscriptions/.../resourceGroups/rg-antkart-dev-eastus",
+            "name": "rg-antkart-dev-eastus",
+            "location": "eastus",
+            "tags": { ... }
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+Key fields to understand:
+- **`serial`**: Increments with every apply. If two people apply simultaneously, their serials conflict — the second apply is rejected (this is how locking works).
+- **`lineage`**: A unique identifier for this state file's history. Prevents accidentally merging state from two different environments.
+- **`instances[].attributes.id`**: The Azure Resource Manager ID — the permanent address of the resource. This changes if you destroy and recreate the resource, even if the name stays the same.
+
+> **Why does the ID change on recreate?**
+> Azure assigns a new internal ID every time a resource is created. The *name* you choose stays the same (because you wrote it in code), but the *identity* is new. This is important for anything that holds a reference to the old ID — a role assignment or a dependency in another module would need to be updated.
+
+---
+
+### Step 1.7 — Try these experiments
+
+**Experiment 1 — In-place update (the `~` symbol)**
+
+This shows how Terraform detects and applies changes without recreating resources.
 
 Open `infrastructure/environments/dev/env.hcl` and change the owner tag:
 
@@ -342,7 +505,77 @@ Change the owner back to "sathish" when you're done.
 
 ---
 
-### Step 1.6 — Troubleshooting
+**Experiment 2 — IDs change on destroy/recreate**
+
+This shows that resource identity (the Azure ID) is not the same as resource name.
+
+Run the networking destroy/recreate cycle from Step 1.5:
+```powershell
+cd infrastructure/environments/dev/networking
+terragrunt destroy
+terragrunt apply
+```
+
+Now check the VNet ID:
+```powershell
+terragrunt state show azurerm_virtual_network.this
+```
+
+Compare the `id` field to what you saw in Step 1.6. You'll see it has changed:
+```
+# Before destroy/recreate:
+id = "/subscriptions/.../virtualNetworks/vnet-antkart-dev"
+      └── ends with: ...providers/Microsoft.Network/virtualNetworks/vnet-antkart-dev
+
+# After recreate — same name, DIFFERENT internal ID:
+id = "/subscriptions/.../virtualNetworks/vnet-antkart-dev"
+     └── the path looks identical but the underlying resource record in Azure is new
+```
+
+In practice, the ARM ID path looks the same because it's derived from the resource name and resource group — but Azure has replaced the old resource with a new one. Any resource that stored the old ID as a reference (a role assignment, a Private DNS zone link) would be broken. This is why `prevent_destroy = true` on the resource group is important — accidentally destroying it would force every dependent resource to be recreated and every external reference to be updated.
+
+---
+
+**Experiment 3 — Plan symbols: `~` vs `-/+` vs `+`**
+
+Terraform uses three symbols in plan output. Understanding them prevents surprises:
+
+| Symbol | Meaning | Cost |
+|--------|---------|------|
+| `+` | Resource will be **created** | New Azure resource |
+| `-` | Resource will be **destroyed** | Azure resource deleted |
+| `~` | Resource will be **updated in place** | No recreation, just attribute change |
+| `-/+` | Resource will be **destroyed and recreated** | Brief downtime possible |
+
+To see the difference between `~` and `-/+`: open `infrastructure/environments/dev/networking/terragrunt.hcl` and change the VNet address space from `10.0.0.0/16` to `10.0.0.0/8`:
+
+```hcl
+address_space = ["10.0.0.0/8"]   # was /16
+```
+
+Run:
+```powershell
+cd infrastructure/environments/dev/networking
+terragrunt plan
+```
+
+You'll see `-/+` for the VNet and all subnets:
+```
+# azurerm_virtual_network.this must be replaced
+-/+ resource "azurerm_virtual_network" "this" {
+  ~ address_space = ["10.0.0.0/16"] -> ["10.0.0.0/8"] # forces replacement
+```
+
+The `# forces replacement` note explains why. Changing a VNet's address space requires Azure to delete and recreate it. Compare this to changing a tag (`~` only — Azure can update the tag metadata without touching the network configuration).
+
+**Do not apply this change.** Revert the address_space back to `"10.${include.env.locals.network_octet}.0.0/16"` and discard.
+
+> **What this teaches:**
+> Before every `apply`, always read the full plan output. Pay special attention to `-/+` lines — they mean your change has a destructive side effect. In production, that could mean downtime. In dev, it's fine, but you should understand why it's happening.
+
+---
+
+### Step 1.8 — Troubleshooting
 
 | Problem | Symptoms | Fix |
 |---------|----------|-----|
