@@ -172,12 +172,18 @@ resource "azurerm_cosmosdb_mongo_database" "products" {
 #   Week 5: Transition to Workload Identity — no static secret needed at all;
 #           pods use their managed identity to read Key Vault secrets directly
 #
-# connection_strings[0] = primary read-write connection string (MongoDB format)
-#   "mongodb://cosmos-antkart-dev:<key>@cosmos-antkart-dev.mongo.cosmos.azure.com:10255/..."
+# The MongoDB API connection string is constructed from primary_key + account name.
+# azurerm v4 removed the connection_strings attribute from azurerm_cosmosdb_account —
+# the string must be built explicitly. Format documented by Microsoft:
+#   mongodb://<account>:<key>@<account>.mongo.cosmos.azure.com:10255/?ssl=true&...
 # -----------------------------------------------------------------------------
+locals {
+  mongo_connection_string = "mongodb://${azurerm_cosmosdb_account.this.name}:${azurerm_cosmosdb_account.this.primary_key}@${azurerm_cosmosdb_account.this.name}.mongo.cosmos.azure.com:10255/?ssl=true&replicaSet=globaldb&retrywrites=false&maxIdleTimeMS=120000&appName=@${azurerm_cosmosdb_account.this.name}@"
+}
+
 resource "azurerm_key_vault_secret" "cosmos_connection_string" {
   name         = "cosmos-connection-string"
-  value        = azurerm_cosmosdb_account.this.connection_strings[0]
+  value        = local.mongo_connection_string
   key_vault_id = var.key_vault_id
 
   tags = merge(var.tags, {

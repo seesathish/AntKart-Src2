@@ -49,7 +49,10 @@ output "connection_string" {
     (secret name: "cosmos-connection-string"), not from Terraform output.
 
     Format: mongodb://cosmos-antkart-dev:<key>@cosmos-antkart-dev.mongo.cosmos.azure.com:10255/?ssl=true&...
+
+    Note: azurerm v4 removed connection_strings from azurerm_cosmosdb_account.
+    The string is constructed in locals from primary_key + account name.
   EOT
-  value     = azurerm_cosmosdb_account.this.connection_strings[0]
+  value     = local.mongo_connection_string
   sensitive = true
 }
