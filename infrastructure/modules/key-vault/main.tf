@@ -80,7 +80,8 @@ resource "azurerm_key_vault" "this" {
 
   # Use Azure RBAC for authorization — see the module header for full explanation.
   # Once set to true, all access policy entries are ignored by Azure.
-  enable_rbac_authorization = true
+  # Renamed from enable_rbac_authorization in azurerm ~> 4.x (old name removed in v5).
+  rbac_authorization_enabled = true
 
   # Soft-delete + purge protection: see module header for full explanation.
   soft_delete_retention_days = var.soft_delete_retention_days
