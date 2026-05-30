@@ -419,6 +419,82 @@ When asked to build a new service `AK.<Name>`, follow this order:
 
 ---
 
+## Phase 2 — Cloud Infrastructure (Terraform + Terragrunt)
+
+### Overview
+
+Phase 2 moves AntKart from Docker Compose to Azure. Infrastructure lives in `infrastructure/` and is managed with **Terraform** (IaC engine) and **Terragrunt** (DRY orchestration wrapper). See `DevelopmentGuide.md` for the step-by-step guide and `docs/adr/ADR-009` and `ADR-010` for architectural decisions.
+
+### Repository structure
+
+```
+infrastructure/
+├── root.hcl                          ← Root config: backend (Azure Blob Storage) + provider (azurerm ~> 4.0)
+├── modules/                          ← Reusable, environment-agnostic modules
+│   ├── resource-group/               ✅ DONE — prevent_destroy = true
+│   ├── networking/                   ✅ DONE — VNet, 3 subnets, 2 NSGs
+│   ├── acr/                          ✅ DONE — Basic SKU, admin disabled, RBAC
+│   ├── key-vault/                    ✅ DONE — RBAC auth, purge protection, Secrets Officer role
+│   ├── log-analytics/                ✅ DONE — PerGB2018, 30-day retention
+│   └── app-insights/                 ✅ DONE — workspace-based (linked to log-analytics)
+└── environments/
+    ├── dev/
+    │   ├── env.hcl                   ← Dev values: location=eastus, network_octet=0
+    │   ├── resource-group/           ✅ deployed
+    │   ├── networking/               ✅ deployed
+    │   ├── acr/                      ✅ deployed — acrantkartdev.azurecr.io
+    │   ├── key-vault/                ✅ deployed — kv-antkart-dev
+    │   ├── log-analytics/            ✅ deployed — log-antkart-dev
+    │   └── app-insights/             ✅ deployed — appi-antkart-dev
+    ├── staging/env.hcl               ← TODO (network_octet=1)
+    └── prod/env.hcl                  ← TODO (network_octet=2)
+```
+
+### Terragrunt conventions
+
+- Root config is named **`root.hcl`** (not `terragrunt.hcl` — deprecated). See ADR-009.
+- Every child `terragrunt.hcl` must use `find_in_parent_folders("root.hcl")` explicitly — without the argument, it defaults to searching for `terragrunt.hcl`.
+- Each module folder contains: `main.tf`, `variables.tf`, `outputs.tf`, `README.md`
+- All `.tf` files carry teaching comments explaining WHAT and WHY — match this style for new modules
+- `prevent_destroy = true` on resource group and Key Vault; not on ACR, networking, or Log Analytics
+
+### Key values
+
+| Item | Value |
+|------|-------|
+| Subscription ID | `1a69c45b-82ed-4ec6-972e-c9a5933e6fd0` |
+| Tenant ID | `4cacc56a-0d38-46c4-ba20-429d51d7b449` |
+| Region | `eastus` |
+| TF state storage account | `stantkarttfstate2026` (container: `tfstate`) |
+| TF state resource group | `rg-antkart-tfstate` |
+| Dev resource group | `rg-antkart-dev-eastus` |
+| ACR login server | `acrantkartdev.azurecr.io` |
+| Key Vault URI | `https://kv-antkart-dev.vault.azure.net/` |
+
+### Authentication
+
+All Terraform runs authenticate via `ARM_*` environment variables — never hardcoded:
+```
+ARM_CLIENT_ID, ARM_CLIENT_SECRET, ARM_TENANT_ID, ARM_SUBSCRIPTION_ID
+```
+The Service Principal (`antkart-terraform-sp`) has:
+- `Contributor` on the subscription
+- `User Access Administrator` on the subscription (required to create role assignments)
+
+### Module patterns for new modules (Week 3+)
+
+- Include root: `include "root" { path = find_in_parent_folders("root.hcl") }`
+- Include env: `include "env" { path = find_in_parent_folders("env.hcl"); expose = true; merge_strategy = "no_merge" }`
+- Reference resource group: `dependency "resource_group" { config_path = "../resource-group" }` — always use `dependency.resource_group.outputs.name`, never hardcode the RG name
+- Sensitive outputs: mark `sensitive = true` on instrumentation keys, connection strings, shared keys
+- Lock files (`.terraform.lock.hcl`): commit these — they pin provider versions across machines
+
+### Critical operational rule
+
+**The Azure portal is read-only once Terraform manages a resource.** Never create, modify, or delete resources from the portal — only view them. All changes go through `.tf`/`.hcl` files and `terragrunt apply`. Portal edits cause drift and break future applies.
+
+---
+
 ## Postman Collection
 
 Single file: `AntKart.postman_collection.json` at repo root.
