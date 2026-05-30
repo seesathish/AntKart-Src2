@@ -423,7 +423,7 @@ When asked to build a new service `AK.<Name>`, follow this order:
 
 ### Overview
 
-Phase 2 moves AntKart from Docker Compose to Azure. Infrastructure lives in `infrastructure/` and is managed with **Terraform** (IaC engine) and **Terragrunt** (DRY orchestration wrapper). See `DevelopmentGuide.md` for the step-by-step guide and `docs/adr/ADR-009` and `ADR-010` for architectural decisions.
+Phase 2 moves AntKart from Docker Compose to Azure. Infrastructure lives in `infrastructure/` and is managed with **Terraform** (IaC engine) and **Terragrunt** (DRY orchestration wrapper). See `DevelopmentGuide.md` for the step-by-step guide and `docs/adr/ADR-009`, `ADR-010`, `ADR-011` for architectural decisions.
 
 ### Repository structure
 
@@ -436,7 +436,9 @@ infrastructure/
 │   ├── acr/                          ✅ DONE — Basic SKU, admin disabled, RBAC
 │   ├── key-vault/                    ✅ DONE — RBAC auth, purge protection, Secrets Officer role
 │   ├── log-analytics/                ✅ DONE — PerGB2018, 30-day retention
-│   └── app-insights/                 ✅ DONE — workspace-based (linked to log-analytics)
+│   ├── app-insights/                 ✅ DONE — workspace-based (linked to log-analytics)
+│   ├── cosmosdb/                     ✅ DONE — MongoDB API, Serverless, prevent_destroy = true; writes connection string to KV
+│   └── servicebus/                   ✅ DONE — Standard SKU; order-commands queue, integration-events topic + 2 subscriptions; writes connection string to KV
 └── environments/
     ├── dev/
     │   ├── env.hcl                   ← Dev values: location=eastus, network_octet=0
@@ -445,7 +447,9 @@ infrastructure/
     │   ├── acr/                      ✅ deployed — acrantkartdev.azurecr.io
     │   ├── key-vault/                ✅ deployed — kv-antkart-dev
     │   ├── log-analytics/            ✅ deployed — log-antkart-dev
-    │   └── app-insights/             ✅ deployed — appi-antkart-dev
+    │   ├── app-insights/             ✅ deployed — appi-antkart-dev
+    │   ├── cosmosdb/                 ✅ wired — deploy: cd environments/dev/cosmosdb && terragrunt apply
+    │   └── servicebus/               ✅ wired — deploy: cd environments/dev/servicebus && terragrunt apply
     ├── staging/env.hcl               ← TODO (network_octet=1)
     └── prod/env.hcl                  ← TODO (network_octet=2)
 ```
@@ -456,7 +460,7 @@ infrastructure/
 - Every child `terragrunt.hcl` must use `find_in_parent_folders("root.hcl")` explicitly — without the argument, it defaults to searching for `terragrunt.hcl`.
 - Each module folder contains: `main.tf`, `variables.tf`, `outputs.tf`, `README.md`
 - All `.tf` files carry teaching comments explaining WHAT and WHY — match this style for new modules
-- `prevent_destroy = true` on resource group and Key Vault; not on ACR, networking, or Log Analytics
+- `prevent_destroy = true` on resource group, Key Vault, and Cosmos DB (stateful data); NOT on ACR, networking, Log Analytics, or Service Bus (stateless / replaceable)
 
 ### Key values
 
@@ -470,6 +474,10 @@ infrastructure/
 | Dev resource group | `rg-antkart-dev-eastus` |
 | ACR login server | `acrantkartdev.azurecr.io` |
 | Key Vault URI | `https://kv-antkart-dev.vault.azure.net/` |
+| Cosmos DB account | `cosmos-antkart-dev` (MongoDB API, Serverless) — KV secret: `cosmos-connection-string` |
+| Service Bus namespace | `sb-antkart-dev` (Standard) — KV secret: `servicebus-connection-string` |
+| Service Bus queue | `order-commands` (point-to-point commands) |
+| Service Bus topic | `integration-events` + `products-subscription` + `notification-subscription` |
 
 ### Authentication
 
@@ -488,6 +496,8 @@ The Service Principal (`antkart-terraform-sp`) has:
 - Reference resource group: `dependency "resource_group" { config_path = "../resource-group" }` — always use `dependency.resource_group.outputs.name`, never hardcode the RG name
 - Sensitive outputs: mark `sensitive = true` on instrumentation keys, connection strings, shared keys
 - Lock files (`.terraform.lock.hcl`): commit these — they pin provider versions across machines
+- `prevent_destroy = true` on stateful resources (resource group, Key Vault, Cosmos DB); omit on stateless infra (Service Bus, ACR, Log Analytics)
+- Connection strings: always write to Key Vault as a secret in the module's `main.tf`; never output raw to `terragrunt output`
 
 ### Critical operational rule
 

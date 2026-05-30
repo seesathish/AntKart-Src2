@@ -1087,6 +1087,287 @@ az keyvault secret delete --vault-name kv-antkart-dev --name "TestSecret"
 
 ---
 
+## Section 3: Data and Messaging Infrastructure — Cosmos DB & Service Bus
+
+### What you're about to do
+
+In this section you'll provision two services that replace the Docker containers AntKart used in Phase 1:
+
+- **Azure Cosmos DB (MongoDB API, Serverless)** — replaces the local `mongo:7` Docker container for AK.Products; wire-compatible with `MongoDB.Driver`
+- **Azure Service Bus (Standard SKU)** — replaces the local `rabbitmq:3-management` Docker container; wire-compatible with MassTransit
+
+Both services write their connection strings to the Key Vault you deployed in Section 2. No credentials touch your code or terminal output.
+
+### Why it matters
+
+**Why Cosmos DB instead of keeping a self-hosted MongoDB container?**
+
+The Phase 1 `mongo:7` Docker container is fine for a single developer's laptop. In Azure:
+- There's no managed MongoDB service from Microsoft — you'd run a VM with MongoDB, own the patching, backups, and availability
+- Cosmos DB with the MongoDB API is wire-compatible with `MongoDB.Driver` — your application code doesn't change; only the connection string changes
+- Serverless billing means zero idle cost: you pay per Request Unit consumed, not per hour the container exists
+
+**Why Service Bus instead of keeping RabbitMQ?**
+
+Same managed-service argument: no broker cluster to operate, native Azure Monitor integration, and MassTransit's Service Bus transport is configured with one line change — the consumer classes and integration events are unchanged. See ADR-011 for the full SKU comparison.
+
+**Why does the Service Bus cost warning matter?**
+
+Cosmos DB Serverless has zero idle cost — it's safe to leave running all the time. Service Bus Standard charges ~$10/month even when no messages flow. Unlike Cosmos DB (which holds your product data), Service Bus is stateless messaging infrastructure — destroy it between dev sessions when you're not actively developing the messaging features.
+
+---
+
+### Step 3.1 — Deploy Cosmos DB
+
+Set your ARM environment variables if not already set (same as Step 1.1 in Section 1):
+
+```powershell
+$env:ARM_CLIENT_ID     = "<sp-client-id>"
+$env:ARM_CLIENT_SECRET = "<sp-client-secret>"
+$env:ARM_TENANT_ID     = "4cacc56a-0d38-46c4-ba20-429d51d7b449"
+$env:ARM_SUBSCRIPTION_ID = "1a69c45b-82ed-4ec6-972e-c9a5933e6fd0"
+```
+
+```powershell
+cd infrastructure/environments/dev/cosmosdb
+terragrunt init
+terragrunt plan
+```
+
+Expected plan:
+```
++ azurerm_cosmosdb_account.this         will be created
++ azurerm_cosmosdb_mongo_database.products  will be created
++ azurerm_key_vault_secret.cosmos_connection_string  will be created
+
+Plan: 3 to add, 0 to change, 0 to destroy.
+```
+
+> **Three resources:** the account (the top-level container), the MongoDB database inside it
+> (`antkart-products`), and a Key Vault secret holding the connection string. Cosmos DB
+> account creation typically takes 2-4 minutes.
+
+```powershell
+terragrunt apply
+```
+
+Expected output:
+```
+azurerm_cosmosdb_account.this: Creating...
+azurerm_cosmosdb_account.this: Still creating... [1m elapsed]
+azurerm_cosmosdb_account.this: Still creating... [2m elapsed]
+azurerm_cosmosdb_account.this: Creation complete after 3m
+
+azurerm_cosmosdb_mongo_database.products: Creating...
+azurerm_cosmosdb_mongo_database.products: Creation complete after 10s
+
+azurerm_key_vault_secret.cosmos_connection_string: Creating...
+azurerm_key_vault_secret.cosmos_connection_string: Creation complete after 5s
+
+Apply complete! Resources: 3 added, 0 changed, 0 destroyed.
+
+Outputs:
+database_name = "antkart-products"
+endpoint      = "https://cosmos-antkart-dev.documents.azure.com:443/"
+id            = "/subscriptions/.../databaseAccounts/cosmos-antkart-dev"
+name          = "cosmos-antkart-dev"
+```
+
+> `connection_string` is marked sensitive — it won't appear in the output. The string
+> has already been written to Key Vault. Read it when needed:
+> ```powershell
+> terragrunt output -raw connection_string
+> # Or read directly from Key Vault:
+> az keyvault secret show --vault-name kv-antkart-dev --name "cosmos-connection-string" --query value -o tsv
+> ```
+
+> **Name uniqueness:** If you see `DatabaseAccountAlreadyExists`, the name
+> `cosmos-antkart-dev` is taken globally. Change the `name` input in
+> `environments/dev/cosmosdb/terragrunt.hcl` (e.g., `cosmos-antkart-dev-2026`) and re-apply.
+
+---
+
+### Step 3.2 — Deploy Service Bus
+
+```powershell
+cd ../servicebus
+terragrunt init
+terragrunt plan
+```
+
+Expected plan:
+```
++ azurerm_servicebus_namespace.this                          will be created
++ azurerm_servicebus_queue.order_commands                    will be created
++ azurerm_servicebus_topic.integration_events                will be created
++ azurerm_servicebus_subscription.products                   will be created
++ azurerm_servicebus_subscription.notification               will be created
++ azurerm_key_vault_secret.servicebus_connection_string      will be created
+
+Plan: 6 to add, 0 to change, 0 to destroy.
+```
+
+> **Six resources in one apply:** the namespace (the top-level container), a command queue,
+> an event topic, two independent subscriptions on that topic (one for AK.Products, one for
+> AK.Notification), and the Key Vault secret for the connection string.
+
+```powershell
+terragrunt apply
+```
+
+Expected output:
+```
+azurerm_servicebus_namespace.this: Creating...
+azurerm_servicebus_namespace.this: Creation complete after 45s
+
+azurerm_servicebus_queue.order_commands: Creating...
+azurerm_servicebus_queue.order_commands: Creation complete after 15s
+
+azurerm_servicebus_topic.integration_events: Creating...
+azurerm_servicebus_topic.integration_events: Creation complete after 10s
+
+azurerm_servicebus_subscription.products: Creating...
+azurerm_servicebus_subscription.notification: Creating...
+azurerm_servicebus_subscription.products: Creation complete after 10s
+azurerm_servicebus_subscription.notification: Creation complete after 10s
+
+azurerm_key_vault_secret.servicebus_connection_string: Creating...
+azurerm_key_vault_secret.servicebus_connection_string: Creation complete after 5s
+
+Apply complete! Resources: 6 added, 0 changed, 0 destroyed.
+
+Outputs:
+namespace_id   = "/subscriptions/.../namespaces/sb-antkart-dev"
+namespace_name = "sb-antkart-dev"
+```
+
+> The `connection_string` output is marked sensitive. Retrieve it from Key Vault:
+> ```powershell
+> az keyvault secret show --vault-name kv-antkart-dev --name "servicebus-connection-string" --query value -o tsv
+> ```
+
+---
+
+### Step 3.3 — Verify in the Azure Portal
+
+1. Go to **portal.azure.com** → **Resource groups** → **rg-antkart-dev-eastus**
+2. You should now see these additional resources alongside the ones from Sections 1 and 2:
+
+   | Resource | Type |
+   |----------|------|
+   | `cosmos-antkart-dev` | Azure Cosmos DB account |
+   | `sb-antkart-dev` | Service Bus Namespace |
+
+3. **Cosmos DB:** Click `cosmos-antkart-dev` → **Data Explorer** → expand **antkart-products** database. You'll see the database is empty — collections will be created by AK.Products on first startup (Cosmos DB MongoDB API creates collections lazily).
+
+4. **Cosmos DB — Serverless confirmation:** Click **Settings** → **Features**. The **Serverless** capability should be listed as enabled. There is no throughput provisioned (no RU/s slider) — billing is purely per-operation.
+
+5. **Service Bus messaging topology:** Click `sb-antkart-dev` → **Queues** — you should see `order-commands`. Click **Topics** — you should see `integration-events`. Click `integration-events` → **Subscriptions** — you should see `products-subscription` and `notification-subscription`, each with their own independent message cursor.
+
+6. **Key Vault secrets:** Click `kv-antkart-dev` → **Secrets**. You should now see:
+   - `cosmos-connection-string`
+   - `servicebus-connection-string`
+
+   Click each secret → **CURRENT VERSION** → **Show Secret Value** to confirm the values were written correctly.
+
+---
+
+### Step 3.4 — Cost note for Section 3
+
+| Resource | Billing model | Estimated cost |
+|----------|--------------|----------------|
+| Cosmos DB (Serverless) | Per RU consumed | ~$0 idle; ~$1-3/month light dev use |
+| Service Bus Standard | ~$10/month base + per-op | ~$10/month when running |
+| **Section 3 addition** | | **~$1–13/month** |
+| **Running total (Sections 1-3)** | | **~$6–18/month** |
+
+**Save the Service Bus cost when not developing messaging features:**
+```powershell
+cd infrastructure/environments/dev/servicebus
+terragrunt destroy   # saves ~$10/month; takes ~30 seconds
+
+# When you need it again:
+terragrunt apply     # recreates in ~60 seconds
+```
+
+Terragrunt updates the Key Vault secret with the new connection string automatically on re-apply. Restart any running services to pick up the refreshed secret.
+
+---
+
+### Try this — Send and peek a test message via the Service Bus Explorer
+
+The Azure portal's built-in Service Bus Explorer lets you send and receive messages without writing any code. This is the fastest way to verify the namespace is working.
+
+**Send a test message to the queue:**
+
+1. Portal → `sb-antkart-dev` → **Queues** → `order-commands`
+2. Click **Service Bus Explorer** (in the left menu)
+3. Select **Send messages** tab
+4. Set **Content type** to `application/json`
+5. Paste this body:
+   ```json
+   {
+     "orderId": "test-001",
+     "userId": "user-test",
+     "total": 99.99
+   }
+   ```
+6. Click **Send** — you should see `Message sent successfully`
+
+**Peek at the message (non-destructive read):**
+
+1. Switch to the **Peek from start** tab
+2. Click **Peek** — the message body appears below
+3. The message count on the queue stays at 1 (peek doesn't consume the message)
+
+**Dead-letter a message by exhausting delivery attempts:**
+
+1. Go to **Receive messages** tab → set **Receive mode** to `ReceiveAndDelete`
+2. Receive 10 times (or leave the count at 10) — Azure automatically dead-letters the message after `max_delivery_count = 10` redelivery failures
+3. Switch to the **Dead-letter** sub-queue: URL bar will show `/$DeadLetterQueue`
+4. Peek from start — the dead-lettered message appears with properties showing the dead-letter reason
+
+> **Why this matters:** In production, if AK.Order crashes while processing a message 10 times, the message doesn't disappear — it lands in the dead-letter queue where you can inspect it and replay it after fixing the bug. This is the audit trail pattern that makes the system observable.
+
+---
+
+### Try this — Verify the Cosmos DB connection string works
+
+This confirms that the MongoDB-API connection string written to Key Vault is valid and can authenticate with the account.
+
+```powershell
+# Read the connection string from Key Vault
+$connStr = az keyvault secret show `
+  --vault-name kv-antkart-dev `
+  --name "cosmos-connection-string" `
+  --query value -o tsv
+
+# Verify it starts with "mongodb://" (MongoDB API format)
+Write-Host $connStr.Substring(0, 50)
+# Expected: mongodb://cosmos-antkart-dev:...
+```
+
+> The connection string format is `mongodb://<account>:<key>@<account>.mongo.cosmos.azure.com:10255/?ssl=true&...`
+> This is exactly what `MongoDB.Driver`'s `MongoClient` accepts.
+> In AK.Products' `appsettings.json`, replace the `MongoDbSettings:ConnectionString` value
+> with this string (or better: store it in Key Vault and read it via the Secrets Store CSI Driver in AKS).
+
+---
+
+### Step 3.5 — Troubleshooting
+
+| Problem | Symptoms | Fix |
+|---------|----------|-----|
+| **Cosmos DB name taken** | `DatabaseAccountAlreadyExists` during apply | Cosmos DB account names are globally unique. Change `name` in `cosmosdb/terragrunt.hcl` (e.g., `cosmos-antkart-dev-2026`) and re-apply |
+| **Cosmos DB name taken (soft-delete)** | `DatabaseAccountAlreadyExists` after a destroy | Cosmos DB accounts have a 30-day soft-delete period. Purge it: `az cosmosdb delete --name cosmos-antkart-dev --resource-group rg-antkart-dev-eastus --yes` — or just use a different name suffix |
+| **Service Bus name taken** | `NamespaceAlreadyExists` during apply | Change `name` in `servicebus/terragrunt.hcl` (e.g., `sb-antkart-dev-2026`) and re-apply |
+| **KV secret 403 on cosmos secret** | `ForbiddenByRbac` when Terraform writes the connection string secret | The Terraform SP needs `Key Vault Secrets Officer` on the vault. Check the role assignment exists: `az role assignment list --scope /subscriptions/.../vaults/kv-antkart-dev --role "Key Vault Secrets Officer"` |
+| **Cosmos DB apply takes >10 minutes** | Terraform shows "Still creating..." for a long time | Normal — Cosmos DB global replication setup takes 3-8 minutes. Wait; do not cancel |
+| **MongoDB connection refused from app** | App can't connect after switching from local Docker Mongo | Confirm connection string from Key Vault starts with `mongodb://`. Ensure `ssl=true` is in the query string. Cosmos DB MongoDB API requires TLS |
+| **Service Bus send 401** | `UnauthorizedException` when sending a message from the app | Connection string changed after a destroy/recreate cycle. Restart the service to reload the Key Vault secret |
+
+---
+
 ## Appendix A — Deploying all dev modules at once
 
 Once you're comfortable with the individual steps, Terragrunt's `run-all` command lets you deploy everything in one command from the environment root:
