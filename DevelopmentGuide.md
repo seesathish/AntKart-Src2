@@ -75,6 +75,29 @@ Azure Blob Storage solves all three: centralised, durable, and with blob lease-b
 
 ---
 
+> ### ⚠️ Critical Discipline: The Portal is Read-Only
+>
+> Once Terraform manages a resource, **never create, modify, or delete it from the Azure portal.** Use the portal only to *view* what Terraform has built.
+>
+> **Why this matters — "drift":**
+> When you change something in the portal, Terraform doesn't know about it. The portal and Terraform's state file now disagree about what exists. This is called drift. On the next `terragrunt plan`, Terraform will try to undo your portal change — because as far as it's concerned, the desired state is still what's in the code. If you deleted a resource from the portal, the next `apply` will try to recreate it. If you modified one, Terraform will overwrite your change. Either way, the portal edit was wasted work.
+>
+> **The correct workflows:**
+> | Goal | Wrong | Right |
+> |------|-------|-------|
+> | Change a tag | Edit in portal | Edit `env.hcl`, run `terragrunt apply` |
+> | Delete a resource | Delete in portal | Run `terragrunt destroy` |
+> | Add a new resource | Create in portal | Write it in `.tf`, run `terragrunt apply` |
+> | Investigate an issue | ✅ Portal is fine | — (read-only is always OK) |
+>
+> **What happens if you break the rule:**
+> If a resource is deleted from the portal, Terraform's state still records it as existing. The next `terragrunt plan` will show an error or try to recreate it in a partially-configured state. Fix by running `terragrunt state rm <resource>` to remove it from state (tells Terraform to forget about it), then let `apply` recreate it cleanly.
+>
+> **The habit that makes this easy:**
+> Treat `.tf` and `.hcl` files the same way you treat application source code. If it's not in Git, it doesn't exist. Anything you type into the portal is temporary and will be overwritten.
+
+---
+
 ### Step 1.1 — Set your credentials
 
 Terraform authenticates to Azure using a Service Principal. Think of a Service Principal as a dedicated identity for automated tools — like a service account in Active Directory. The credentials are passed via environment variables so they never touch any file.
@@ -675,14 +698,391 @@ The `# forces replacement` note explains why. Changing a VNet's address space re
 
 ---
 
-### What's next — Section 2: Container Registry and Key Vault
+---
 
-In Section 2 you'll provision:
+## Section 2: Container Registry, Secrets, and Observability Foundation
 
-- **Azure Container Registry (ACR)** — where your Docker images live in Azure. When GitHub Actions builds your microservices, it pushes images here. AKS pulls from here to deploy.
-- **Azure Key Vault** — where your secrets live. Razorpay keys, database passwords, SMTP credentials — all move out of `appsettings.json` and `docker-compose.yml` into Key Vault. AKS retrieves them at pod startup via the Secrets Store CSI Driver.
+### What you're about to do
 
-By the end of Section 2, you'll have a container registry that AKS can pull from and a vault that stores every secret AntKart needs.
+In this section you'll provision four Azure resources that every subsequent week
+depends on:
+
+1. **Azure Container Registry (ACR)** — the private Docker registry for all AntKart images
+2. **Azure Key Vault** — the central secrets vault; no more credentials in appsettings.json
+3. **Azure Log Analytics Workspace** — the telemetry data lake for the entire platform
+4. **Azure Application Insights** — the APM layer; distributed traces across all 8 services
+
+By the end of this section, you'll have a registry AKS can pull from, a vault that
+holds every secret, and a telemetry foundation that will light up the moment microservices
+start sending data.
+
+---
+
+### Why it matters
+
+**Why a container registry?**
+
+Docker Compose runs images from Docker Hub or builds them locally. AKS cannot do either.
+AKS pulls images at pod startup — it needs them in a registry it can reach. ACR is
+co-located with Azure (fast pull, no egress charge) and integrates with AKS via managed
+identity (no passwords to manage). Every microservice image you build in CI/CD will be
+pushed here before AKS can run it.
+
+**Why a secrets vault?**
+
+Right now, Razorpay keys, the Keycloak client secret, database passwords, and SMTP
+credentials live in `appsettings.json` and `docker-compose.yml`. That's acceptable for
+Phase 1 (local, private, no production data). It is not acceptable for Phase 2, where:
+- The repo might be shared or made public
+- Multiple developers and pipelines need access to the same credentials
+- Credentials must be rotatable without redeploying the application
+
+Key Vault solves all three: secrets live in one place, access is RBAC-controlled, and
+rotating a secret doesn't require a new Docker image.
+
+**Why observability this early?**
+
+The worst time to add observability is after something breaks in production. Setting up
+Log Analytics and App Insights now means every microservice that connects to the cluster
+gets distributed tracing, exception tracking, and performance baselines from the first
+request. When something goes wrong in Week 5 (and it will), you'll have 3 weeks of
+telemetry to look at.
+
+---
+
+### The four services — brief orientation
+
+**Azure Container Registry (ACR)**
+
+A private Docker registry hosted in Azure. Images are pushed by CI/CD pipelines and
+pulled by AKS node pools. AKS authenticates using the node's managed identity with the
+`AcrPull` RBAC role — no passwords, no stored credentials. We start on the Basic SKU
+(~$5/month) and upgrade to Premium when private networking is required.
+
+**Azure Key Vault**
+
+A managed secrets store. Secrets are key-value pairs accessed via HTTPS. Authorization
+uses Azure RBAC — the deploying Service Principal gets `Key Vault Secrets Officer`
+(manage secrets) and AKS nodes will get `Key Vault Secrets User` (read-only) when the
+cluster is provisioned. Soft-delete and purge protection prevent accidental permanent
+deletion. Effectively free for this workload (~$0.03 per 10,000 operations).
+
+**Azure Log Analytics Workspace**
+
+A managed data store for structured log and metric data. All observability signals for
+the AntKart platform flow here: App Insights traces, AKS Container Insights (pod/node
+metrics), NSG flow logs, and Key Vault audit logs. One workspace covers all 8 services
+in a single KQL query. The first 5 GB/month is free — dev AntKart traffic stays well
+within that.
+
+**Azure Application Insights**
+
+The APM layer. Linked to the Log Analytics Workspace in "workspace-based" mode (required
+for all new App Insights resources — the older "classic" mode was retired in Feb 2024).
+Once microservices send their connection string, you get distributed traces, dependency
+graphs, exception tracking, and live metrics with no additional infrastructure.
+
+---
+
+### Step 2.1 — Check ACR name availability
+
+ACR names must be globally unique across all of Azure. Verify your name before applying:
+
+```powershell
+az acr check-name --name acrantkartdev
+```
+
+Expected output if available:
+```json
+{
+  "message": null,
+  "nameAvailable": true,
+  "reason": null
+}
+```
+
+If `nameAvailable` is `false`, edit the name in `environments/dev/acr/terragrunt.hcl`:
+```hcl
+name = "acrantkartdev2026"   # or any unique alphanumeric name
+```
+
+Key Vault names are also globally unique. `kv-antkart-dev` is 14 characters and
+distinctive — it is very likely available, but if not:
+```hcl
+name = "kv-antkart-dev2"   # append a suffix
+```
+
+---
+
+### Step 2.2 — Deploy Log Analytics (first — App Insights depends on it)
+
+```powershell
+cd infrastructure/environments/dev/log-analytics
+terragrunt init
+terragrunt plan
+```
+
+Expected plan:
+```
++ azurerm_log_analytics_workspace.this   will be created
+
+Plan: 1 to add, 0 to change, 0 to destroy.
+```
+
+```powershell
+terragrunt apply
+```
+
+Expected output:
+```
+azurerm_log_analytics_workspace.this: Creating...
+azurerm_log_analytics_workspace.this: Creation complete after 15s
+
+Apply complete! Resources: 1 added, 0 changed, 0 destroyed.
+
+Outputs:
+id           = "/subscriptions/.../workspaces/log-antkart-dev"
+name         = "log-antkart-dev"
+workspace_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+```
+
+> **Notice:** `primary_shared_key` is marked `sensitive` — Terraform deliberately omits
+> it from the output. It's stored in state (encrypted in Blob Storage) and can be read
+> with `terragrunt output -raw primary_shared_key` when needed.
+
+---
+
+### Step 2.3 — Deploy Application Insights
+
+```powershell
+cd ../app-insights
+terragrunt init
+terragrunt plan
+```
+
+Expected plan:
+```
++ azurerm_application_insights.this   will be created
+
+Plan: 1 to add, 0 to change, 0 to destroy.
+```
+
+> **Notice:** Terragrunt resolved the workspace ID by reading the log-analytics module's
+> state output — you didn't type the workspace ID anywhere. The `dependency` block in
+> `app-insights/terragrunt.hcl` did this automatically.
+
+```powershell
+terragrunt apply
+```
+
+Expected output:
+```
+azurerm_application_insights.this: Creating...
+azurerm_application_insights.this: Creation complete after 10s
+
+Apply complete! Resources: 1 added, 0 changed, 0 destroyed.
+
+Outputs:
+name = "appi-antkart-dev"
+```
+
+> `instrumentation_key` and `connection_string` are both marked sensitive — they won't
+> appear in the output. Read them individually when needed:
+> ```powershell
+> terragrunt output -raw connection_string
+> ```
+
+---
+
+### Step 2.4 — Deploy ACR
+
+```powershell
+cd ../acr
+terragrunt init
+terragrunt plan
+```
+
+Expected plan:
+```
++ azurerm_container_registry.this   will be created
+
+Plan: 1 to add, 0 to change, 0 to destroy.
+```
+
+```powershell
+terragrunt apply
+```
+
+Expected output:
+```
+azurerm_container_registry.this: Creating...
+azurerm_container_registry.this: Creation complete after 30s
+
+Apply complete! Resources: 1 added, 0 changed, 0 destroyed.
+
+Outputs:
+id           = "/subscriptions/.../registries/acrantkartdev"
+login_server = "acrantkartdev.azurecr.io"
+name         = "acrantkartdev"
+```
+
+---
+
+### Step 2.5 — Deploy Key Vault
+
+```powershell
+cd ../key-vault
+terragrunt init
+terragrunt plan
+```
+
+Expected plan:
+```
++ azurerm_key_vault.this                          will be created
++ azurerm_role_assignment.deployer_secrets_officer will be created
+
+Plan: 2 to add, 0 to change, 0 to destroy.
+```
+
+> **Two resources:** the vault itself, and the role assignment granting your Terraform
+> Service Principal the `Key Vault Secrets Officer` role. Without this role assignment,
+> even the SP that created the vault cannot read or write secrets.
+
+```powershell
+terragrunt apply
+```
+
+Expected output:
+```
+azurerm_key_vault.this: Creating...
+azurerm_key_vault.this: Creation complete after 45s
+azurerm_role_assignment.deployer_secrets_officer: Creating...
+azurerm_role_assignment.deployer_secrets_officer: Creation complete after 20s
+
+Apply complete! Resources: 2 added, 0 changed, 0 destroyed.
+
+Outputs:
+id        = "/subscriptions/.../vaults/kv-antkart-dev"
+name      = "kv-antkart-dev"
+vault_uri = "https://kv-antkart-dev.vault.azure.net/"
+```
+
+---
+
+### Step 2.6 — Verify in the Azure Portal
+
+1. Go to https://portal.azure.com → **Resource groups** → **rg-antkart-dev-eastus**
+2. You should now see these resources alongside the VNet and NSGs from Week 1:
+   | Resource | Type |
+   |----------|------|
+   | `acrantkartdev` | Container registry |
+   | `kv-antkart-dev` | Key vault |
+   | `log-antkart-dev` | Log Analytics workspace |
+   | `appi-antkart-dev` | Application Insights |
+
+3. Click **`kv-antkart-dev`** → **Access control (IAM)** → **Role assignments**
+   You should see your Service Principal listed with the role **Key Vault Secrets Officer**.
+   This confirms RBAC authorization is working — no "Access policies" blade needed.
+
+4. Click **`appi-antkart-dev`** → look at the **Overview** pane.
+   You should see `Workspace: log-antkart-dev` — confirming workspace-based mode.
+
+5. Click **`acrantkartdev`** → **Properties**. Note:
+   - Admin user: **Disabled** ✓
+   - Login server: `acrantkartdev.azurecr.io`
+
+---
+
+### Cost note for Section 2
+
+| Resource | Monthly cost (dev) |
+|----------|-------------------|
+| ACR Basic | ~$5 |
+| Key Vault standard | ~$0 (< 10k operations/month in dev) |
+| Log Analytics (first 5 GB free) | $0 |
+| Application Insights (workspace-based, data in LA) | $0 |
+| **Section 2 total** | **~$5/month** |
+
+Running total after Week 1 + Week 2: **~$5/month** (networking is free; resource group is free).
+
+ACR upgrade path: when the AKS cluster is hardened to private networking, changing
+`sku = "Premium"` in `acr/terragrunt.hcl` + one `terragrunt apply` upgrades the
+registry in place. No recreation, no image loss.
+
+---
+
+### Try this — Store and retrieve a secret in Key Vault
+
+This experiment confirms that RBAC is working and gives you the `az keyvault` CLI
+workflow you'll use every time you need to manage secrets.
+
+```powershell
+# Make sure your ARM_ environment variables are set (from Step 1.1)
+# and that you're authenticated as the Terraform SP
+
+# Store a test secret
+az keyvault secret set `
+  --vault-name kv-antkart-dev `
+  --name "TestSecret" `
+  --value "hello-from-antkart"
+```
+
+Expected output:
+```json
+{
+  "id": "https://kv-antkart-dev.vault.azure.net/secrets/TestSecret/...",
+  "name": "TestSecret",
+  "value": "hello-from-antkart"
+}
+```
+
+```powershell
+# Retrieve it
+az keyvault secret show `
+  --vault-name kv-antkart-dev `
+  --name "TestSecret" `
+  --query value `
+  -o tsv
+```
+
+Expected output:
+```
+hello-from-antkart
+```
+
+```powershell
+# List all secrets in the vault
+az keyvault secret list --vault-name kv-antkart-dev -o table
+```
+
+```powershell
+# Clean up the test secret
+az keyvault secret delete --vault-name kv-antkart-dev --name "TestSecret"
+# (It goes into soft-deleted state — won't affect anything)
+```
+
+> **What this teaches:**
+> The `az keyvault secret set` command worked because the Terraform SP now has the
+> `Key Vault Secrets Officer` role — granted by the role assignment created in Step 2.5.
+> If you try the same command with a user or SP that has no role assignment on this
+> vault, it will fail with `403 Forbidden`. That's RBAC working exactly as intended.
+>
+> In Week 3, when AKS is deployed, you'll store the real secrets (Razorpay keys, DB
+> passwords, App Insights connection string) and mount them into pods via the Secrets
+> Store CSI Driver — no credentials in Docker images or Kubernetes manifests.
+
+---
+
+### Step 2.7 — Troubleshooting
+
+| Problem | Symptoms | Fix |
+|---------|----------|-----|
+| **ACR name taken** | `RegistryNameAlreadyExists` during apply | Check availability: `az acr check-name --name acrantkartdev`. Change name in `acr/terragrunt.hcl` and re-apply |
+| **Key Vault name in soft-delete** | `VaultAlreadyExists: A vault with the same name already exists in deleted state` | Purge it: `az keyvault purge --name kv-antkart-dev --location eastus`. Then re-apply |
+| **Role assignment 403** | `AuthorizationFailed` creating the role assignment | The SP needs `User Access Administrator` or `Owner` at the subscription level to create role assignments. Ask your architect |
+| **App Insights workspace_id missing** | `workspace_id is required` | Deploy log-analytics first. Check `terragrunt output` in the log-analytics directory — if it shows no outputs, the workspace wasn't applied |
+| **Sensitive output blank** | `terragrunt output connection_string` returns empty | Add `-raw` flag: `terragrunt output -raw connection_string` |
+| **KV secret set 403** | `Caller is not authorized` on `az keyvault secret set` | The role assignment may still be propagating (can take 2-5 minutes after apply). Wait and retry |
 
 ---
 
