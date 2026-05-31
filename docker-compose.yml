@@ -59,10 +59,7 @@ services:
       - Keycloak__Realm=antkart
       - Keycloak__ClientId=antkart-client
       - Keycloak__ClientSecret=antkart-secret
-      - RabbitMq__Host=rabbitmq
-      - RabbitMq__VirtualHost=/
-      - RabbitMq__Username=guest
-      - RabbitMq__Password=guest
+      - ServiceBus__FullyQualifiedNamespace=sb-antkart-dev.servicebus.windows.net
       - Elasticsearch__Url=http://elasticsearch:9200
     depends_on:
       mongodb:
@@ -71,8 +68,6 @@ services:
         condition: service_healthy
       ak-discount-grpc:
         condition: service_started
-      rabbitmq:
-        condition: service_healthy
       elasticsearch:
         condition: service_healthy
 
@@ -127,17 +122,12 @@ services:
       Keycloak__Realm: "antkart"
       Keycloak__ClientId: "antkart-client"
       Keycloak__ClientSecret: "antkart-secret"
-      RabbitMq__Host: "rabbitmq"
-      RabbitMq__VirtualHost: "/"
-      RabbitMq__Username: "guest"
-      RabbitMq__Password: "guest"
+      ServiceBus__FullyQualifiedNamespace: "sb-antkart-dev.servicebus.windows.net"
       Elasticsearch__Url: "http://elasticsearch:9200"
     depends_on:
       redis:
         condition: service_healthy
       keycloak:
-        condition: service_healthy
-      rabbitmq:
         condition: service_healthy
       elasticsearch:
         condition: service_healthy
@@ -179,17 +169,12 @@ services:
       Keycloak__Realm: "antkart"
       Keycloak__ClientId: "antkart-client"
       Keycloak__ClientSecret: "antkart-secret"
-      RabbitMq__Host: "rabbitmq"
-      RabbitMq__VirtualHost: "/"
-      RabbitMq__Username: "guest"
-      RabbitMq__Password: "guest"
+      ServiceBus__FullyQualifiedNamespace: "sb-antkart-dev.servicebus.windows.net"
       Elasticsearch__Url: "http://elasticsearch:9200"
     depends_on:
       postgres:
         condition: service_healthy
       keycloak:
-        condition: service_healthy
-      rabbitmq:
         condition: service_healthy
       elasticsearch:
         condition: service_healthy
@@ -215,17 +200,12 @@ services:
       Keycloak__Realm: "antkart"
       Keycloak__ClientId: "antkart-client"
       Keycloak__ClientSecret: "antkart-secret"
-      RabbitMq__Host: "rabbitmq"
-      RabbitMq__VirtualHost: "/"
-      RabbitMq__Username: "guest"
-      RabbitMq__Password: "guest"
+      ServiceBus__FullyQualifiedNamespace: "sb-antkart-dev.servicebus.windows.net"
       Elasticsearch__Url: "http://elasticsearch:9200"
     depends_on:
       postgres:
         condition: service_healthy
       keycloak:
-        condition: service_healthy
-      rabbitmq:
         condition: service_healthy
       elasticsearch:
         condition: service_healthy
@@ -248,37 +228,13 @@ services:
       Keycloak__Realm: "antkart"
       Keycloak__ClientId: "antkart-client"
       Keycloak__ClientSecret: "antkart-secret"
-      RabbitMq__Host: "rabbitmq"
-      RabbitMq__VirtualHost: "/"
-      RabbitMq__Username: "guest"
-      RabbitMq__Password: "guest"
+      ServiceBus__FullyQualifiedNamespace: "sb-antkart-dev.servicebus.windows.net"
       Elasticsearch__Url: "http://elasticsearch:9200"
     depends_on:
       keycloak:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
       elasticsearch:
         condition: service_healthy
-
-  rabbitmq:
-    image: rabbitmq:3.13-management
-    container_name: antkart-rabbitmq
-    restart: unless-stopped
-    ports:
-      - "5672:5672"
-      - "15672:15672"
-    environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
 
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
@@ -340,10 +296,7 @@ services:
       Keycloak__Realm: "antkart"
       Keycloak__ClientId: "antkart-client"
       Keycloak__ClientSecret: "antkart-secret"
-      RabbitMq__Host: "rabbitmq"
-      RabbitMq__VirtualHost: "/"
-      RabbitMq__Username: "guest"
-      RabbitMq__Password: "guest"
+      ServiceBus__FullyQualifiedNamespace: "sb-antkart-dev.servicebus.windows.net"
       EmailSettings__From: "antkartadmin@gmail.com"
       EmailSettings__DisplayName: "AntKart"
       EmailSettings__Host: "mailhog"
@@ -357,8 +310,6 @@ services:
       postgres:
         condition: service_healthy
       keycloak:
-        condition: service_healthy
-      rabbitmq:
         condition: service_healthy
       elasticsearch:
         condition: service_healthy
@@ -405,5 +356,4 @@ volumes:
   mongodb_data:
   discount_data:
   postgres_data:
-  rabbitmq_data:
   elasticsearch_data:

@@ -27,7 +27,7 @@ public static class ServiceCollectionExtensions
 
         services.AddNpgsqlResilience();
 
-        services.AddRabbitMqMassTransit(configuration, "order", cfg =>
+        services.AddServiceBusMassTransit(configuration, "order", cfg =>
         {
             cfg.AddSagaStateMachine<OrderSaga, OrderSagaState>()
                .EntityFrameworkRepository(r =>

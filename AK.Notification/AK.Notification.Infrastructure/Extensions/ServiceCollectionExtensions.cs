@@ -40,7 +40,7 @@ public static class ServiceCollectionExtensions
         services.Configure<EmailSettings>(configuration.GetSection("EmailSettings"));
         services.Configure<NotificationSettings>(configuration.GetSection("NotificationSettings"));
 
-        services.AddRabbitMqMassTransit(configuration, "notification", cfg =>
+        services.AddServiceBusMassTransit(configuration, "notification", cfg =>
         {
             cfg.AddConsumer<UserRegisteredConsumer>();
             cfg.AddConsumer<OrderCreatedConsumer>();

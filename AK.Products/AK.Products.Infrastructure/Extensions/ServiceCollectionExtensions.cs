@@ -30,7 +30,7 @@ public static class ServiceCollectionExtensions
         .AddHttpResilienceWithCircuitBreaker(maxRetryAttempts: 3, failureRatio: 0.5, minimumThroughput: 3, breakDurationSeconds: 30);
         services.AddScoped<IDiscountGrpcClient, DiscountGrpcClient>();
 
-        services.AddRabbitMqMassTransit(configuration, "products", cfg =>
+        services.AddServiceBusMassTransit(configuration, "products", cfg =>
         {
             cfg.AddConsumer<ReserveStockConsumer>();
         });

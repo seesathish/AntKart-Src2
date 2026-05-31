@@ -1368,6 +1368,483 @@ Write-Host $connStr.Substring(0, 50)
 
 ---
 
+## Section 4: Migrating Messaging to Azure Service Bus (Enterprise Dev Model)
+
+### The enterprise development model — developing against real cloud services
+
+Before touching any code, it's important to understand the shift in how we develop.
+
+**Phase 1 (local stack):** Every dependency ran as a Docker container on your laptop. `docker-compose up` started MongoDB, PostgreSQL, Redis, RabbitMQ, Keycloak, and all six microservices together. You worked in a fully local bubble.
+
+**Phase 2 (enterprise model):** We run only the service(s) we are actively developing locally. Everything else — messaging (Service Bus), the product database (Cosmos DB), secrets (Key Vault) — runs in Azure. You develop locally, but against real cloud infrastructure.
+
+**Why is this the right approach?**
+
+| Concern | Full local stack | Enterprise model |
+|---------|-----------------|-----------------|
+| **Environment parity** | Local broker behaves differently to Service Bus — different dead-lettering, different TTL semantics, different retry behaviour | You test against the actual service you'll run in production — no surprises at deploy time |
+| **Dependency sprawl** | 12+ containers running at once, eating RAM and startup time | Run only what you need for the feature you're building |
+| **Security realism** | Local RabbitMQ has no auth — your code never exercises credential flows | Token auth via `az login` works the same way Workload Identity will work in AKS — you test the auth path locally |
+| **Realistic failure modes** | Local broker never flaps, never rate-limits, never has latency | Real cloud services have real transient errors — your retry policies are tested for real |
+| **Cost** | No Azure cost for messaging locally | Service Bus Standard is ~$10/month — manageable for a dev namespace that you can destroy when idle |
+
+This is how enterprise teams build distributed systems: local code, cloud dependencies. It's a mindset shift from "everything must be local" to "cloud is where the system lives — let's develop against it."
+
+---
+
+### Azure Service Bus — a complete explanation
+
+**What is Azure Service Bus?**
+
+Azure Service Bus is a fully managed enterprise message broker hosted in Azure. Think of it as a post office for your microservices: services drop off messages and pick up messages without ever needing to know about each other directly.
+
+It replaces the RabbitMQ Docker container used in Phase 1. The replacement is managed (no server to operate), SLA-backed (99.9% uptime), and natively integrated with Azure authentication.
+
+**Namespaces**
+
+The top-level container is a **namespace** — a unique hostname in Azure: `sb-antkart-dev.servicebus.windows.net`. Every queue, topic, and subscription lives inside the namespace. The namespace is what you authenticate against.
+
+**Queues**
+
+A queue implements **point-to-point** messaging: one publisher, one consumer. Each message is delivered to exactly one consumer, and once processed, it's gone.
+
+```
+Publisher ──► [queue] ──► Consumer A (only one consumer gets each message)
+```
+
+Use queues for **commands**: "process this payment", "send this email". Commands should be handled by exactly one service instance. AntKart uses a conceptual `order-commands` queue pattern — the SAGA in AK.Order is the single handler.
+
+**Topics and subscriptions**
+
+A topic implements **publish-subscribe** messaging: one publisher, many independent subscribers. Each subscription on a topic gets an independent copy of every message.
+
+```
+Publisher ──► [topic]
+                 ├──► [subscription A] ──► Consumer A (gets its own copy)
+                 └──► [subscription B] ──► Consumer B (gets its own copy)
+```
+
+Use topics for **events**: "an order was created". Multiple services react to the same event independently. In AntKart:
+
+```
+AK.Order publishes OrderCreatedIntegrationEvent
+   ──► integration-events topic
+         ├──► order-order-saga subscription       ──► OrderSaga in AK.Order
+         ├──► products-reserve-stock subscription ──► ReserveStockConsumer in AK.Products
+         ├──► notification-order-created          ──► OrderCreatedConsumer in AK.Notification
+         └──► cart-clear-cart-on-order-confirmed  ──► ClearCartOnOrderConfirmedConsumer in AK.ShoppingCart
+```
+
+Adding a new consumer to an event requires only a new subscription — the publisher never changes.
+
+**Dead-letter queue**
+
+Every queue and subscription automatically has a dead-letter sub-queue. Messages land there when:
+- A consumer fails to process the message after `max_delivery_count` attempts (default: 10)
+- The message TTL expires before being processed
+
+Dead-lettered messages are visible in the Azure portal's Service Bus Explorer. You can:
+- Read the message body and delivery metadata to diagnose what went wrong
+- Replay the message to the main queue/subscription after fixing the bug
+
+This is the "observable failure" pattern — broken messages are preserved and inspectable rather than silently discarded.
+
+**How Service Bus compares to RabbitMQ**
+
+| Feature | RabbitMQ (Phase 1) | Azure Service Bus (Phase 2) |
+|---------|-------------------|----------------------------|
+| Hosting | Docker container, self-managed | Fully managed Azure service |
+| Auth | Username + password | Token-based (Azure AD) |
+| SLA | None (single container) | 99.9% (Standard) |
+| Dead-lettering | Manual setup | Built-in |
+| Azure Monitor | Manual exporter | Native metrics and alerts |
+| MassTransit support | ✅ | ✅ (same consumer code) |
+| Dev cost | $0 (local) | ~$10/month (destroy when idle) |
+
+The critical point: **MassTransit abstracts the broker**. Consumer classes, the SAGA state machine, the EF Core outbox — none of them know whether the transport is RabbitMQ or Service Bus. The Week 4 migration changed exactly one file's transport configuration and nothing else in the business logic.
+
+---
+
+### Token-based authentication with DefaultAzureCredential
+
+**The problem with connection strings**
+
+The traditional way to connect to a message broker is a connection string:
+```
+Endpoint=sb://sb-antkart-dev.servicebus.windows.net;SharedAccessKey=...
+```
+
+A connection string is a secret. It must be stored somewhere, rotated periodically, and kept out of source control. If it leaks, anyone with the string can send and receive messages until you rotate it. It also creates an ops problem: different secrets for local dev, staging, and production.
+
+**The token-based solution**
+
+Azure AD issues short-lived tokens (1 hour TTL) to authenticated identities. A token proves identity without exposing a long-lived secret. The token is obtained automatically by the SDK — you never handle it in your application code.
+
+`DefaultAzureCredential` is the credential object from the `Azure.Identity` package. It implements a **credential chain** — it tries each authentication source in order and stops at the first one that succeeds:
+
+```
+DefaultAzureCredential tries, in order:
+  1. EnvironmentCredential       — reads ARM_CLIENT_ID + ARM_CLIENT_SECRET environment variables
+  2. WorkloadIdentityCredential  — reads Kubernetes federated token (AKS, Week 7+)
+  3. ManagedIdentityCredential   — reads Azure VM/App Service managed identity
+  4. SharedTokenCacheCredential  — reads Visual Studio token cache
+  5. VisualStudioCredential      — reads Visual Studio sign-in
+  6. AzureCliCredential          — reads `az login` session token ← WINS on your machine
+  7. AzurePowerShellCredential   — reads Az PowerShell login
+  8. InteractiveBrowserCredential — opens a browser sign-in window (last resort)
+```
+
+**On your developer machine:**
+
+You have run `az login`. The Azure CLI stores your session token in `~/.azure/accessTokens.json`. When your service starts and first tries to connect to Service Bus, `DefaultAzureCredential` reaches step 6, reads your CLI token, and exchanges it for a Service Bus access token. No connection string. No secret file. Just your existing login session.
+
+**In AKS (Week 7+):**
+
+The pod has a projected service account token mounted at a path managed by the Workload Identity webhook. `DefaultAzureCredential` reaches step 2 (`WorkloadIdentityCredential`), reads the projected token, and exchanges it for a Service Bus access token. No secret mounted in the pod. No connection string in a Kubernetes Secret object.
+
+**Same code. Both places.** The credential source is an environment concern — the code is identical.
+
+**What this looks like in the code:**
+
+```csharp
+// AK.BuildingBlocks/Messaging/MassTransitExtensions.cs
+cfg.Host(new Uri($"sb://{fullyQualifiedNamespace}/"), h =>
+{
+    h.TokenCredential = new DefaultAzureCredential();
+});
+```
+
+`fullyQualifiedNamespace` is read from `appsettings.json`:
+```json
+"ServiceBus": {
+  "FullyQualifiedNamespace": "sb-antkart-dev.servicebus.windows.net"
+}
+```
+
+The namespace FQDN is not a secret — it's the public DNS name of the namespace. Only the token (obtained lazily by the SDK at runtime) proves identity.
+
+---
+
+### MassTransit as the messaging abstraction
+
+MassTransit is the layer that sits between your application code and the message broker. Your consumers, sagas, and publishers talk to MassTransit's APIs. MassTransit translates those calls to whatever transport is configured — RabbitMQ, Service Bus, Amazon SQS, or even in-memory for tests.
+
+This is why the Week 4 migration touched zero consumer code: consumers call `context.Publish()`, `context.Send()`, and `context.RespondAsync()` — MassTransit APIs. The transport is an implementation detail.
+
+**How MassTransit maps to Service Bus topology:**
+
+MassTransit automatically creates Service Bus entities when a service starts (requires Manage permission from the Data Owner role):
+
+- **One topic per message type**, named from the .NET type's full name:
+  ```
+  ak.buildingblocks.messaging.integrationevents:ordercreatedintegrationevent
+  ```
+- **One subscription per consumer endpoint**, named `<servicePrefix>-<consumer-kebab>`:
+  ```
+  products-reserve-stock   ← ReserveStockConsumer in AK.Products, prefix "products"
+  notification-order-created ← OrderCreatedConsumer in AK.Notification, prefix "notification"
+  ```
+
+The service prefix (`"products"`, `"notification"`, etc.) passed to `AddServiceBusMassTransit()` ensures uniquely named subscriptions. Without it, two services consuming the same event would compete for messages on a single subscription — only one would receive each message. With unique prefixes, each service gets its own subscription and each receives every message independently (fan-out).
+
+---
+
+### Step 4.1 — Grant yourself the Azure Service Bus Data Owner role
+
+Before running any service locally, your Azure identity needs permission to create topics, send messages, and receive messages on the Service Bus namespace.
+
+```powershell
+# Step 1: Get your signed-in object ID
+$myObjectId = az ad signed-in-user show --query id -o tsv
+Write-Host "Your object ID: $myObjectId"
+
+# Step 2: Get the Service Bus namespace resource ID
+$namespaceId = az servicebus namespace show `
+  --name sb-antkart-dev `
+  --resource-group rg-antkart-dev-eastus `
+  --query id -o tsv
+Write-Host "Namespace resource ID: $namespaceId"
+
+# Step 3: Grant the role (paste the values from above if the variables didn't capture)
+az role assignment create `
+  --role "Azure Service Bus Data Owner" `
+  --assignee $myObjectId `
+  --scope $namespaceId
+```
+
+Expected output from step 3:
+```json
+{
+  "principalId": "<your-object-id>",
+  "roleDefinitionName": "Azure Service Bus Data Owner",
+  "scope": "/subscriptions/.../namespaces/sb-antkart-dev"
+}
+```
+
+**What "Azure Service Bus Data Owner" grants:**
+- **Manage** — create and delete topics, queues, subscriptions (needed for MassTransit auto-topology)
+- **Send** — publish messages to topics and queues
+- **Listen/Receive** — consume messages from subscriptions and queues
+
+> **RBAC propagation:** Role assignments in Azure take 1-5 minutes to propagate. If you see `401 Unauthorized` from Service Bus in the first few minutes after assigning, wait and retry. This is expected.
+
+---
+
+### Step 4.2 — Confirm az login and DefaultAzureCredential
+
+Before starting any service, confirm your CLI session is active and pointing at the right tenant:
+
+```powershell
+# Confirm you are logged in and which account is active
+az account show --query "{name:name, user:user.name, tenantId:tenantId}" -o table
+```
+
+Expected output:
+```
+Name              User                        TenantId
+----------------  --------------------------  ------------------------------------
+AntKart           antkartadmin@gmail.com      4cacc56a-0d38-46c4-ba20-429d51d7b449
+```
+
+If you see a different subscription or tenant:
+```powershell
+az login --tenant 4cacc56a-0d38-46c4-ba20-429d51d7b449
+az account set --subscription 1a69c45b-82ed-4ec6-972e-c9a5933e6fd0
+```
+
+**How to verify DefaultAzureCredential will find your CLI session:**
+
+```powershell
+# Install Azure.Identity test script (or just trust the chain — it always finds az login)
+az account get-access-token --resource "https://servicebus.azure.net/" --query accessToken -o tsv | Select-Object -First 1 -ExpandProperty Length
+# If this returns a non-zero number, the token was retrieved successfully
+```
+
+---
+
+### Step 4.3 — Run services locally against Azure Service Bus
+
+In the enterprise model, you run only the services you are working on. For the complete order flow, you need four services running locally:
+
+| Service | Port | What it does in the flow |
+|---------|------|--------------------------|
+| AK.Order | 5080 | Accepts order creation; runs OrderSaga; publishes OrderCreatedIntegrationEvent |
+| AK.Products | 5077 | Consumes OrderCreated; reserves stock; publishes StockReserved or StockReservationFailed |
+| AK.Payments | 5086 | Consumes OrderConfirmed (stub); uses Razorpay for payment processing |
+| AK.Notification | 5087 | Consumes all events; sends emails (via Mailhog locally) |
+
+You also need local infrastructure (no cloud for these):
+```powershell
+# Start local infrastructure (postgres, redis, mailhog — not rabbitmq, that's gone)
+docker-compose up postgres redis mailhog -d
+```
+
+Open four terminal windows and run each service:
+
+```powershell
+# Terminal 1 — Order service
+cd AK.Order/AK.Order.API
+dotnet run
+
+# Terminal 2 — Products service
+cd AK.Products/AK.Products.API
+dotnet run
+
+# Terminal 3 — Payments service
+cd AK.Payments/AK.Payments.API
+dotnet run
+
+# Terminal 4 — Notification service
+cd AK.Notification/AK.Notification.API
+dotnet run
+```
+
+**What to look for in startup logs:**
+
+Each service should log something like:
+```
+info: MassTransit[0]
+      Bus started: azure-service-bus://sb-antkart-dev.servicebus.windows.net/
+```
+
+If you see this, MassTransit connected to Service Bus using your `az login` credential and auto-created its subscriptions. If you see a `401 Unauthorized` or `TokenRequestFailedException`, see the troubleshooting table below.
+
+**VS Code compound launch (optional):**
+
+Add this to `.vscode/launch.json` to start all four services with F5:
+```json
+{
+  "version": "0.2.0",
+  "compounds": [
+    {
+      "name": "AntKart Order Flow",
+      "configurations": ["AK.Order", "AK.Products", "AK.Payments", "AK.Notification"]
+    }
+  ],
+  "configurations": [
+    { "name": "AK.Order",        "type": "coreclr", "request": "launch", "preLaunchTask": "build", "program": "${workspaceFolder}/AK.Order/AK.Order.API/bin/Debug/net9.0/AK.Order.API.dll", "cwd": "${workspaceFolder}/AK.Order/AK.Order.API" },
+    { "name": "AK.Products",     "type": "coreclr", "request": "launch", "preLaunchTask": "build", "program": "${workspaceFolder}/AK.Products/AK.Products.API/bin/Debug/net9.0/AK.Products.API.dll", "cwd": "${workspaceFolder}/AK.Products/AK.Products.API" },
+    { "name": "AK.Payments",     "type": "coreclr", "request": "launch", "preLaunchTask": "build", "program": "${workspaceFolder}/AK.Payments/AK.Payments.API/bin/Debug/net9.0/AK.Payments.API.dll", "cwd": "${workspaceFolder}/AK.Payments/AK.Payments.API" },
+    { "name": "AK.Notification", "type": "coreclr", "request": "launch", "preLaunchTask": "build", "program": "${workspaceFolder}/AK.Notification/AK.Notification.API/bin/Debug/net9.0/AK.Notification.API.dll", "cwd": "${workspaceFolder}/AK.Notification/AK.Notification.API" }
+  ]
+}
+```
+
+---
+
+### Step 4.4 — Place a test order and trace the flow
+
+First, get a JWT token (if running without a gateway, call Order directly with auth disabled in dev, or use a Keycloak token):
+
+```powershell
+# If running Order with auth disabled for testing, call directly:
+$orderPayload = @'
+{
+  "userId": "test-user-001",
+  "customerEmail": "test@antkart.com",
+  "customerName": "Test User",
+  "shippingAddress": {
+    "street": "123 Main St",
+    "city": "Chennai",
+    "state": "Tamil Nadu",
+    "postalCode": "600001",
+    "country": "India"
+  },
+  "items": [
+    {
+      "productId": "MEN-SHIR-001",
+      "productName": "Classic Cotton Shirt",
+      "quantity": 2,
+      "unitPrice": 899.00
+    }
+  ]
+}
+'@
+
+$response = Invoke-RestMethod -Uri "http://localhost:5080/api/orders" -Method POST -Body $orderPayload -ContentType "application/json"
+Write-Host "Order created: $($response.orderNumber)"
+```
+
+**What happens after this call:**
+
+1. **AK.Order** creates the order in PostgreSQL, publishes `OrderCreatedIntegrationEvent` via the outbox (written to `OutboxMessages` table first, then delivered to Service Bus by MassTransit's outbox worker)
+2. **Service Bus** delivers the event to all subscriptions bound to the `ordercreatedintegrationevent` topic
+3. **AK.Products** (`products-reserve-stock` subscription) receives the event, checks stock, publishes `StockReservedIntegrationEvent`
+4. **AK.Notification** (`notification-order-created` subscription) receives the event, sends an order confirmation email
+5. **AK.ShoppingCart** (`cart-clear-cart-on-order-confirmed` subscription) receives the event, clears the user's cart
+6. **OrderSaga** (`order-order-saga` subscription) receives `OrderCreatedIntegrationEvent`, transitions to `StockPending`, waits
+7. **OrderSaga** then receives `StockReservedIntegrationEvent`, publishes `OrderConfirmedIntegrationEvent`, finalizes
+8. **AK.Order** consumers receive `OrderConfirmedIntegrationEvent`, update the order status to Confirmed
+9. **AK.Notification** receives `OrderConfirmedIntegrationEvent`, sends a stock-confirmed email
+
+---
+
+### Step 4.5 — Verify message flow in the Azure Portal Service Bus Explorer
+
+While the services are running and processing an order:
+
+1. Go to **portal.azure.com** → **sb-antkart-dev** → **Topics**
+2. Click any topic (e.g., `ak.buildingblocks.messaging.integrationevents:ordercreatedintegrationevent`)
+3. Click **Service Bus Explorer** in the left menu
+4. Switch to **Peek from start** → Click **Peek**
+5. If a message is in-flight, you'll see it here. If processed, the count shows 0.
+
+**To watch message counts in real time:**
+
+1. Portal → **sb-antkart-dev** → **Metrics** (in the left menu)
+2. Add metric: **Incoming Messages** — shows messages published per minute
+3. Add metric: **Outgoing Messages** — shows messages consumed per minute
+4. Add metric: **Dead-lettered Messages** — if this increases, a consumer is failing
+
+**To inspect a dead-lettered message:**
+
+1. Portal → **sb-antkart-dev** → **Topics** → select topic → **Subscriptions** → select subscription
+2. Click **Service Bus Explorer** → switch to **Dead-letter** sub-queue
+3. Click **Peek from start** — the failed message appears with metadata:
+   - `DeadLetterReason` — why it was dead-lettered (e.g., `MaxDeliveryCountExceeded`)
+   - `DeadLetterErrorDescription` — the exception message from the consumer
+   - Message body — the original event JSON
+
+---
+
+### Step 4.6 — Set breakpoints in the SAGA and consumers
+
+**Breakpoint in the OrderSaga:**
+
+1. Open `AK.Order/AK.Order.Application/Sagas/OrderSaga.cs`
+2. Set a breakpoint inside the `When(OrderCreated)` block (the `.Then(ctx => { ... })` callback)
+3. Place an order via the API
+4. The breakpoint will hit when the SAGA receives `OrderCreatedIntegrationEvent` from Service Bus
+5. Inspect `ctx.Saga` to see the state being populated, `ctx.Message` to see the incoming event
+
+**Breakpoint in a consumer:**
+
+1. Open `AK.Products/AK.Products.Application/Consumers/ReserveStockConsumer.cs`
+2. Set a breakpoint on the first line of `Consume(ConsumeContext<OrderCreatedIntegrationEvent> context)`
+3. The breakpoint hits when AK.Products receives the event from its `products-reserve-stock` subscription
+
+**Tracing a message end-to-end:**
+
+Each `IIntegrationEvent` has an `EventId` (Guid) and `OccurredOn` (DateTimeOffset). Log the `EventId` when published in AK.Order and look for it in AK.Products and AK.Notification logs. MassTransit also sets a `MessageId` header on every Service Bus message — visible in the portal's Service Bus Explorer message details.
+
+---
+
+### Step 4.7 — Test the happy path and compensation path
+
+**Happy path (stock available, payment succeeds):**
+
+1. Create an order for a product with stock (e.g., `MEN-SHIR-001`, quantity 1)
+2. Expected sequence:
+   - OrderSaga: Initial → StockPending (after OrderCreated)
+   - ReserveStockConsumer: decrements stock, publishes StockReserved
+   - OrderSaga: StockPending → Confirmed (after StockReserved), publishes OrderConfirmed, saga row deleted
+   - Order status in DB: Pending → Confirmed
+3. Check Mailhog (`http://localhost:8025`): two emails should arrive (order confirmation + stock confirmed)
+
+**Compensation path (stock exhausted):**
+
+1. First, deplete stock for a product by creating many orders (or directly update MongoDB)
+2. Create an order for the depleted product
+3. Expected sequence:
+   - OrderSaga: Initial → StockPending (after OrderCreated)
+   - ReserveStockConsumer: stock check fails, publishes StockReservationFailed
+   - OrderSaga: StockPending → Cancelled (after StockReservationFailed), publishes OrderCancelled, saga row deleted
+   - Order status in DB: Pending → Cancelled
+4. Check Mailhog: cancellation email should arrive
+
+---
+
+### Cost note for Week 4
+
+No new Azure resources were created this week — Service Bus was provisioned in Week 3. The weekly cost is unchanged at ~$15-18/month.
+
+Reminder: Service Bus Standard charges ~$10/month even when idle. Destroy when not actively developing messaging features:
+```powershell
+cd infrastructure/environments/dev/servicebus
+terragrunt destroy   # free while idle
+terragrunt apply     # recreates in ~60 seconds when needed
+```
+
+After destroying and recreating, MassTransit will re-create its topics and subscriptions on the next service startup (requires the role assignment to still be present).
+
+---
+
+### Step 4.8 — Troubleshooting
+
+| Problem | Symptoms | Fix |
+|---------|----------|-----|
+| **Role not assigned** | `AuthorizationFailedException: 401 Unauthorized` on Service Bus connection | Grant the role (Step 4.1). Wait 1-5 min for RBAC propagation |
+| **Not logged in** | `CredentialUnavailableException: DefaultAzureCredential failed to retrieve a token` | Run `az login --tenant 4cacc56a-0d38-46c4-ba20-429d51d7b449` |
+| **Wrong tenant** | Token obtained but 401 on namespace | Run `az account show` — if tenant ID doesn't match `4cacc56a-...`, run `az login --tenant <correct-id>` |
+| **Topology 403** | `MessagingEntityNotFoundException` or 403 when MassTransit starts | You need Manage permission — only `Azure Service Bus Data Owner` covers this. `Azure Service Bus Data Sender` and `Receiver` do not |
+| **Messages not arriving** | Publisher succeeds but consumer never fires | Check the portal — is the topic created? Is the subscription created? Check subscription active message count vs dead-letter count |
+| **Dead-letter spike** | Dead-letter message count increasing | Consumer is throwing. Check service logs for exceptions. Inspect the dead-letter message in the portal for `DeadLetterErrorDescription` |
+| **Outbox not delivering** | Order created in DB but event never published | MassTransit outbox has a delivery worker. Check AK.Order logs for outbox worker activity. The `OutboxMessages` table should be empty after delivery |
+| **SAGA stuck in StockPending** | `products-reserve-stock` subscription has active messages | AK.Products is not running, or its consumer threw. Start AK.Products and check for exceptions |
+| **Service Bus namespace destroyed** | `MessagingEntityNotFoundException` — namespace doesn't exist | Run `terragrunt apply` in `environments/dev/servicebus`. MassTransit recreates topology on next start |
+
+---
+
 ## Appendix A — Deploying all dev modules at once
 
 Once you're comfortable with the individual steps, Terragrunt's `run-all` command lets you deploy everything in one command from the environment root:

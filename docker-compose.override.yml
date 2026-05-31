@@ -47,11 +47,6 @@ services:
     ports:
       - "5085:8080"
 
-  rabbitmq:
-    ports:
-      - "5672:5672"
-      - "15672:15672"
-
   elasticsearch:
     environment:
       - ES_JAVA_OPTS=-Xms256m -Xmx256m

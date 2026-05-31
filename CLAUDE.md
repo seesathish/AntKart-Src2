@@ -141,7 +141,7 @@ AK.<Service>/
 - `Messaging/IntegrationEvents/` — `OrderCreatedIntegrationEvent` (enriched: CustomerEmail, CustomerName, OrderNumber), `OrderConfirmedIntegrationEvent` (enriched), `OrderCancelledIntegrationEvent` (enriched + UserId), `PaymentSucceededIntegrationEvent` (enriched), `PaymentFailedIntegrationEvent` (enriched), `UserRegisteredIntegrationEvent` (published by AK.UserIdentity on registration), `StockReservedIntegrationEvent`, `StockReservationFailedIntegrationEvent`, `PaymentInitiatedIntegrationEvent` (consumed by `PaymentInitiatedAuditConsumer` in integration tests)
 - `Behaviors/ValidationBehavior<TRequest, TResponse>` — shared MediatR pipeline behavior; all services (except UserIdentity) wire this from BuildingBlocks; replaces 6 deleted per-service copies
 - `Middleware/ExceptionHandlerMiddleware` — shared exception→HTTP mapper used by ShoppingCart, Order, Payments, Notification, Products; UserIdentity keeps its own (maps `UnauthorizedAccessException` → 401, not 403)
-- `Messaging/MassTransitExtensions` — `AddRabbitMqMassTransit(config, servicePrefix, configure)` helper; each service passes a unique prefix ("order", "notification", "payments", "cart", "products", "identity") so consumers get uniquely-named RabbitMQ queues — e.g. `notification-payment-failed` and `order-payment-failed` are separate queues both bound to the same exchange (fan-out, not competing consumers)
+- `Messaging/MassTransitExtensions` — `AddServiceBusMassTransit(config, servicePrefix, configure)` helper; each service passes a unique prefix ("order", "notification", "payments", "cart", "products", "identity") so consumers get uniquely-named Service Bus subscriptions — e.g. `notification-payment-failed` and `order-payment-failed` are separate subscriptions both bound to the same topic (fan-out, not competing consumers). Uses `DefaultAzureCredential` for token-based auth — no connection string; locally resolves to `az login`, in AKS resolves to Workload Identity
 - `Resilience/ResilienceExtensions` — `AddHttpResilienceWithCircuitBreaker()`, `AddRedisResilience()`, `AddNpgsqlResilience()` (Npgsql uses exponential backoff + jitter to prevent thundering herd on DB reconnect)
 - `Swagger/SwaggerExtensions` — `UseSwaggerInDevelopment(title)` gates `UseSwagger()` + `UseSwaggerUI()` to Development only; `AddSwaggerGen()` registration stays in each service
 - `Versioning/ApiVersioningExtensions` — `AddStandardApiVersioning()` sets default v1.0, accepts version via URL segment (`/api/v1/`) or `api-version` header; currently demonstrated in AK.Order, other services adopt by calling this single method
@@ -317,7 +317,8 @@ Always run `dotnet restore` from the repo root so this config is picked up. Neve
 | Serilog.AspNetCore | 7.x | BuildingBlocks |
 | Serilog.Sinks.Elasticsearch | 9.0.3 | BuildingBlocks |
 | MassTransit | 8.3.6 | BuildingBlocks, Order, Products, ShoppingCart |
-| MassTransit.RabbitMQ | 8.3.6 | Infrastructure (event bus services) |
+| MassTransit.Azure.ServiceBus.Core | 8.3.6 | AK.BuildingBlocks (transport — replaces MassTransit.RabbitMQ in Week 4) |
+| Azure.Identity | 1.13.2 | AK.BuildingBlocks (DefaultAzureCredential for token-based Service Bus auth) |
 | MassTransit.EntityFrameworkCore | 8.3.6 | Order Infrastructure (outbox + saga) |
 | Microsoft.Extensions.Http.Resilience | 9.0.0 | BuildingBlocks, Products Infrastructure |
 | Microsoft.Extensions.Resilience | 9.0.0 | BuildingBlocks, Order/ShoppingCart Infrastructure |
