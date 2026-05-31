@@ -363,6 +363,8 @@ MigrationBackup/
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
 docker-compose.gmail.yml
+# Azure Functions local dev settings (may contain local passwords / namespace names)
+local.settings.json
 
 # Structurizr CLI local cache (Lucene index + thumbnails — generated tooling state)
 docs/architecture/.structurizr/
