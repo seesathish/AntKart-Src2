@@ -722,11 +722,153 @@ The `products_identity_id` and `products_client_id` outputs of this module are t
 
 ---
 
+## Week 6 — Azure Functions, Event Grid & Entra ID Migration
+
+### Overview
+
+Three inter-related production changes in this week:
+
+1. **Keycloak → Microsoft Entra ID** — JWT auth migrated from a Docker container to the managed Azure AD service
+2. **Azure Function** — one MassTransit consumer converted to an isolated worker Azure Function (scales to zero)
+3. **Event Grid** — custom topic added to route `AntKart.UserRegistered` events to Service Bus
+
+All three changes continue the established security principle: `DefaultAzureCredential` everywhere, no connection strings in source.
+
+---
+
+### What changed in the application code
+
+#### AK.BuildingBlocks — Authentication layer rewritten
+
+| File | What changed | Why |
+|---|---|---|
+| `Authentication/AzureAdSettings.cs` | NEW: `TenantId`, `ClientId`, `Audience` | Replaces `KeycloakSettings` for JWT Bearer config |
+| `Authentication/AuthenticationExtensions.cs` | `AddKeycloakAuthentication()` → `AddEntraIdAuthentication()`; authority is Entra OIDC endpoint; `ValidateAudience = true`; `OnTokenValidated` maps `roles` claims to `ClaimTypes.Role` | Entra puts roles as flat `roles` claims — no JSON parsing of `realm_access` needed |
+| `Authentication/HttpContextExtensions.cs` | `GetUserId()` now reads `oid` claim first (then the long-form objectidentifier URI) | In Entra, `sub` is pairwise per-app; `oid` (Object ID) is stable across all apps in the tenant — the IDOR-safe identifier |
+
+**IDOR-safe property preserved:** `GetUserId()` still throws `UnauthorizedAccessException` if neither `oid` nor the URI form is found; middleware maps this to `403`. The client can never supply the user ID in the request body because it is always read from the validated JWT.
+
+#### AK.UserIdentity — Keycloak proxy rewritten as Entra ID / Graph proxy
+
+| File | What changed | Why |
+|---|---|---|
+| `Services/IKeycloakService.cs` | REWRITTEN: `IIdentityService` + `IIdentityAdminService` | Interface names match implementation; removes Keycloak terminology |
+| `Services/KeycloakService.cs` | REWRITTEN: `EntraIdService : IIdentityService` | Calls Entra ID ROPC token endpoint + Microsoft Graph (user creation, role assignment) instead of Keycloak REST API |
+| `Services/KeycloakAdminService.cs` | REWRITTEN: `EntraIdAdminService : IIdentityAdminService` | Graph `/v1.0/users` and `/v1.0/users/{id}/appRoleAssignments` instead of Keycloak admin API |
+| `Services/EntraIdSettings.cs` | NEW: `TenantId`, `ClientId`, `ClientSecret`, `TenantDomain`, `ApiObjectId`, `UserRoleId` | Graph API needs client credentials (app token) for admin operations |
+| `DTOs/AuthDtos.cs` | `KeycloakUserSummary` → `UserSummary` | Removes Keycloak-specific name |
+| `Endpoints/AuthEndpoints.cs` | `IKeycloakService` → `IIdentityService` | Follows interface rename |
+| `Endpoints/AdminEndpoints.cs` | `IKeycloakAdminService` → `IIdentityAdminService` | Follows interface rename |
+| `Program.cs` | Registers `EntraIdService`, `EntraIdAdminService`; HttpClient named `"entra-id"` | Wires new implementations |
+
+**Key behaviour change — `GetUserInfoAsync`:** previously called Keycloak's `/userinfo` endpoint (a network round-trip). Now base64url-decodes the JWT payload locally — reads `oid`, `preferred_username`, `email`, `given_name`, `family_name`, `roles` directly. No network call; the JWT was already validated by Bearer middleware.
+
+**Key behaviour change — `RegisterAsync`:** previously called Keycloak admin API to create a user. Now:
+1. Acquires app-level token from Entra ID (client credentials grant, `https://graph.microsoft.com/.default` scope)
+2. `POST https://graph.microsoft.com/v1.0/users` — creates the user in the directory
+3. `POST https://graph.microsoft.com/v1.0/users/{id}/appRoleAssignments` — assigns the `user` app role
+4. Publishes `UserRegisteredIntegrationEvent` → Service Bus → Notification service sends welcome email
+
+#### All services — appsettings.json
+
+Every service (`Products`, `ShoppingCart`, `Order`, `Payments`, `Notification`, `UserIdentity`, `Gateway`) had its `Keycloak` config section replaced with:
+
+```json
+"AzureAd": {
+  "TenantId":  "PLACEHOLDER_TENANT_ID",
+  "ClientId":  "PLACEHOLDER_API_CLIENT_ID",
+  "Audience":  "PLACEHOLDER_API_AUDIENCE"
+}
+```
+
+Placeholders are filled from `terragrunt output` after the `infrastructure/environments/dev/entra-id` module is applied (see Section 6.2 of DevelopmentGuide.md).
+
+#### All services — Program.cs
+
+```csharp
+// BEFORE (all 7 services):
+builder.Services.AddKeycloakAuthentication(builder.Configuration);
+app.UseKeycloakAuth();
+
+// AFTER (all 7 services):
+builder.Services.AddEntraIdAuthentication(builder.Configuration);
+app.UseEntraIdAuth();
+```
+
+#### AK.Notification — infrastructure split
+
+| File | What changed | Why |
+|---|---|---|
+| `Infrastructure/Extensions/ServiceCollectionExtensions.cs` | `AddInfrastructure()` split into `AddInfrastructureCore()` + `AddInfrastructure()` | Azure Function needs the notification pipeline (MediatR handlers, channels, template renderer) without MassTransit. `AddInfrastructureCore()` registers everything except consumers. `AddInfrastructure()` calls core then adds MassTransit with all 6 consumers. |
+
+---
+
+### What changed in the infrastructure
+
+#### New module: `infrastructure/modules/entra-id/`
+
+| Resource | Purpose |
+|---|---|
+| `azuread_application` (AntKart-API) | Resource server — app roles (`user`, `admin`), OAuth2 scope `access_as_user` |
+| `azuread_application` (AntKart-SPA) | Client — allowed to request `access_as_user` from AntKart-API |
+| `azuread_service_principal` × 2 | Required for RBAC and permission grants |
+| `azuread_service_principal_delegated_permission_grant` | Admin-consents `access_as_user` so users are not prompted |
+
+**Why stable GUIDs for app role IDs?** App role IDs are embedded in tokens and stored as foreign keys in `appRoleAssignment` records. If Terraform regenerates them on each apply (e.g. using `random_uuid`), existing assignments become orphaned. Fixed UUIDs in `variables.tf` defaults prevent this drift.
+
+**Why two app registrations (API + SPA)?** The separation enforces the OAuth2 resource server / client distinction. AntKart-API defines the protected API and its roles/scopes. AntKart-SPA is the client that requests tokens for that API. This allows the SPA to be replaced (or another client added) without touching the API registration.
+
+#### New module: `infrastructure/modules/eventgrid/`
+
+| Resource | Purpose |
+|---|---|
+| `azurerm_eventgrid_topic` | Custom topic receiving `AntKart.UserRegistered` events |
+| `azurerm_eventgrid_event_subscription` | Routes to Service Bus queue `user-registered-events` via `service_bus_queue_endpoint` |
+
+**Why Event Grid in addition to Service Bus?** Event Grid is optimised for event *notification* (push, fan-out, filter by event type). Service Bus is optimised for message *processing* (pull, competing consumers, dead-letter queues). Routing through Event Grid → Service Bus queue combines both: the push/filter semantics of Event Grid with the reliable pull processing of Service Bus.
+
+#### `infrastructure/root.hcl` — azuread provider added
+
+```hcl
+azuread = { source = "hashicorp/azuread", version = "~> 3.0" }
+```
+
+The `azuread` provider uses the same ARM_* environment variables as `azurerm` — no additional auth setup required.
+
+---
+
+### New project: AK.Notification.Functions
+
+| Item | Value |
+|---|---|
+| Project type | Azure Functions isolated worker |
+| Target framework | `net9.0` (with Worker SDK 2.0.7 which added net9.0 support) |
+| Service Bus trigger | Topic `integration-events`, subscription `notification-subscription` |
+| Auth | `DefaultAzureCredential` via `ServiceBusConnection__fullyQualifiedNamespace` |
+| DI | `AddApplication()` + `AddInfrastructureCore()` — no MassTransit |
+
+The function body mirrors `OrderCreatedConsumer.Consume()` exactly — both delegate to `SendNotificationCommand` via MediatR. The email pipeline (template rendering, DB persistence, MailKit delivery) is unchanged.
+
+**Why the Function uses Worker SDK 2.0.7, not 1.17.4:**  
+Worker SDK 1.17.4 only defines the `_ToolingSuffix` MSBuild property for .NET 5–8. With `net9.0`, `_ToolingSuffix` remains empty and the SDK's pre-build validation target fires an error. Worker SDK 2.0.7 adds the `net9.0` suffix condition.
+
+---
+
+### Test changes
+
+| Test class | What changed |
+|---|---|
+| `KeycloakAdminServiceTests.cs` → `EntraIdAdminServiceTests` | Tests `EntraIdAdminService`; uses Graph response format `{ "value": [...] }`; `CreateFactory` is static |
+| `KeycloakServiceTests.cs` → `EntraIdServiceTests` | Tests `EntraIdService`; `GetUserInfoAsync` test builds a fake JWT with `oid` claim in payload and verifies it is read as `result.Id` |
+
+All 620 tests pass.
+
+---
+
 ## Future Weeks (planned)
 
 | Week | Change |
 |------|--------|
-| 6 | Entra ID migration: move remaining services to use Workload Identity for all cloud resource access |
 | 7 | AKS cluster provisioning, ingress controller, Workload Identity federation (linking Week 5 identities to AKS pods) |
 | 8 | Deploy services to AKS: Dockerfiles, Helm charts, image push to ACR |
 | 9 | Observability: Application Insights SDK integration, distributed tracing |

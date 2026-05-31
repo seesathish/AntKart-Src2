@@ -31,7 +31,7 @@ builder.AddSerilogLogging();
 
 // JWT validation at the gateway edge — Ocelot checks the Bearer token before forwarding the request.
 // Downstream services also validate JWTs independently (defence in depth).
-builder.Services.AddKeycloakAuthentication(builder.Configuration);
+builder.Services.AddEntraIdAuthentication(builder.Configuration);
 builder.Services.AddDefaultHealthChecks();
 
 // Required by Ocelot's rate limiting middleware — stores per-route request counters.
@@ -56,7 +56,7 @@ app.UseCors("AllowAll");
 // can be correlated in Kibana by the same ID.
 app.UseMiddleware<CorrelationIdMiddleware>();
 
-app.UseKeycloakAuth();
+app.UseEntraIdAuth();
 app.MapDefaultHealthChecks();
 
 // UseOcelot is async and must be awaited — it sets up all route listeners from ocelot.json.

@@ -12,23 +12,23 @@ builder.WebHost.ConfigureKestrel(o => o.AddServerHeader = false);
 
 builder.AddSerilogLogging();
 
-builder.Services.Configure<KeycloakSettings>(builder.Configuration.GetSection("Keycloak"));
-builder.Services.AddKeycloakAuthentication(builder.Configuration);
+builder.Services.AddEntraIdAuthentication(builder.Configuration);
 builder.Services.AddDefaultHealthChecks();
 builder.Services.AddServiceBusMassTransit(builder.Configuration, "identity", _ => { });
 
-builder.Services.AddHttpClient("keycloak", client =>
+builder.Services.AddHttpClient("entra-id", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(30);
 });
 
-builder.Services.AddScoped<IKeycloakService, KeycloakService>();
-builder.Services.AddScoped<IKeycloakAdminService, KeycloakAdminService>();
+builder.Services.Configure<EntraIdSettings>(builder.Configuration.GetSection("EntraId"));
+builder.Services.AddScoped<IIdentityService, EntraIdService>();
+builder.Services.AddScoped<IIdentityAdminService, EntraIdAdminService>();
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
-    c.SwaggerDoc("v1", new() { Title = "AK.UserIdentity API", Version = "v1", Description = "AntKart User Identity Microservice — Keycloak-backed auth proxy" });
+    c.SwaggerDoc("v1", new() { Title = "AK.UserIdentity API", Version = "v1", Description = "AntKart User Identity Microservice — Microsoft Entra ID auth proxy" });
     c.AddSecurityDefinition("Bearer", new Microsoft.OpenApi.Models.OpenApiSecurityScheme
     {
         Name = "Authorization",
@@ -59,7 +59,7 @@ app.UseMiddleware<ExceptionHandlerMiddleware>();
 
 app.UseSwaggerInDevelopment("AK.UserIdentity API v1");
 
-app.UseKeycloakAuth();
+app.UseEntraIdAuth();
 
 app.MapAuthEndpoints();
 app.MapAdminEndpoints();

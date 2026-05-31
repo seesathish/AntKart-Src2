@@ -27,7 +27,7 @@ public sealed record UserInfoResponse(
 
 public sealed record AssignRoleRequest(string Role);
 
-public sealed record KeycloakUserSummary(
+public sealed record UserSummary(
     string Id,
     string Username,
     string Email,

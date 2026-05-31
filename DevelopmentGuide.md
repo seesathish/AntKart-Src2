@@ -2180,6 +2180,317 @@ For production migrations (if real data existed): use **Azure Database Migration
 
 ---
 
+## Section 6: Azure Functions, Event Grid, Entra ID Migration & E2E Platform Test
+
+**Week 6 objectives:**
+1. Convert one notification consumer to an Azure Function (isolated worker, scales to zero)
+2. Add an Event Grid custom topic for UserRegistered event routing
+3. Migrate all services from Keycloak to Microsoft Entra ID (Azure AD) for JWT authentication
+4. Verify the complete platform end-to-end on Azure-backed services
+
+---
+
+### 6.1 Why these three changes together
+
+These three changes form a cohesive shift toward production-grade Azure services:
+
+| What changed | Local equivalent | Azure equivalent |
+|---|---|---|
+| Keycloak (Docker) | JWT from localhost:8080 | Microsoft Entra ID (managed, global SLA) |
+| MassTransit consumer (always-on) | Notification API keeps running | Azure Function (scales to zero between messages) |
+| Inline event routing | — | Event Grid push routing to Service Bus |
+
+All three use `DefaultAzureCredential` — no connection strings, no client secrets in config.
+
+---
+
+### 6.2 Provision Entra ID App Registrations (Terraform)
+
+Entra ID resources are managed by the `azuread` Terraform provider (tenant-scoped, not resource-group-scoped).
+
+#### Step 6.2.1 — Add the azuread provider to root.hcl
+
+The `infrastructure/root.hcl` already includes:
+
+```hcl
+required_providers {
+  azurerm = { source = "hashicorp/azurerm", version = "~> 4.0" }
+  azuread = { source = "hashicorp/azuread", version = "~> 3.0" }
+}
+```
+
+**Why azuread separately?** The `azurerm` provider manages Azure *resources* (VMs, storage, databases). The `azuread` provider manages Azure *AD objects* (app registrations, service principals, role assignments in the directory). They use separate APIs and auth scopes.
+
+#### Step 6.2.2 — Deploy the Entra ID module
+
+```powershell
+cd infrastructure/environments/dev/entra-id
+terragrunt init    # downloads hashicorp/azuread ~> 3.0 provider
+terragrunt plan
+terragrunt apply
+```
+
+Expected output:
+```
+Apply complete! Resources: 5 added, 0 changed, 0 destroyed.
+
+Outputs:
+  api_client_id  = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  api_audience   = "api://xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  api_object_id  = "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+  spa_client_id  = "zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz"
+  user_role_id   = "11111111-1111-1111-1111-111111111111"
+  admin_role_id  = "22222222-2222-2222-2222-222222222222"
+  tenant_id      = "4cacc56a-0d38-46c4-ba20-429d51d7b449"
+```
+
+#### Step 6.2.3 — Copy outputs into appsettings
+
+All services' `appsettings.json` files have placeholder values for the `AzureAd` section:
+
+```json
+"AzureAd": {
+  "TenantId":  "PLACEHOLDER_TENANT_ID",
+  "ClientId":  "PLACEHOLDER_API_CLIENT_ID",
+  "Audience":  "PLACEHOLDER_API_AUDIENCE"
+}
+```
+
+Replace with the Terraform outputs:
+
+```powershell
+terragrunt output -json
+```
+
+- `TenantId` → `tenant_id` output (`4cacc56a-0d38-46c4-ba20-429d51d7b449`)
+- `ClientId` → `api_client_id` output
+- `Audience` → `api_audience` output (the `api://` URI)
+
+**UserIdentity service** additionally needs the `EntraId` section:
+
+```json
+"EntraId": {
+  "TenantId":     "4cacc56a-0d38-46c4-ba20-429d51d7b449",
+  "ClientId":     "<api_client_id>",
+  "ClientSecret": "<FROM_AZURE_PORTAL — see Step 6.2.4>",
+  "TenantDomain": "<YOUR_TENANT>.onmicrosoft.com",
+  "ApiObjectId":  "<api_object_id>",
+  "UserRoleId":   "<user_role_id>"
+}
+```
+
+#### Step 6.2.4 — Create a client secret for UserIdentity (Graph API calls)
+
+`EntraIdService` calls Microsoft Graph API using client credentials — it needs a client secret to get an app token:
+
+1. **Azure Portal → Entra ID → App Registrations → AntKart-API-dev**
+2. **Certificates & Secrets → New client secret**
+3. Description: `antkart-dev-local`, Expires: 6 months
+4. Copy the secret **Value** immediately (only shown once)
+5. Set `EntraId.ClientSecret` in `AK.UserIdentity/AK.UserIdentity.API/appsettings.json`
+
+> For production, store the secret in Key Vault and retrieve it at startup via `DefaultAzureCredential` + `SecretClient`, the same pattern used for the Cosmos connection string in AK.Products.
+
+---
+
+### 6.3 Provision Event Grid (Terraform)
+
+The `infrastructure/modules/eventgrid` module creates an Event Grid custom topic and an event subscription routing `AntKart.UserRegistered` events → Service Bus queue `user-registered-events`.
+
+```powershell
+cd infrastructure/environments/dev/eventgrid
+terragrunt init
+terragrunt plan
+terragrunt apply
+```
+
+**Service Bus vs Event Grid — why both?**
+
+| Dimension | Azure Service Bus | Azure Event Grid |
+|---|---|---|
+| Model | Pull (consumer polls queue/topic) | Push (Event Grid calls endpoint/resource) |
+| Delivery | Guaranteed, FIFO options, dead-letter queue | At-least-once, 24h retry window |
+| Best for | Commands, workflow steps, ordered processing | Notifications, fan-out, reactive triggers |
+| In AntKart | Order SAGA, payment commands, notification delivery | UserRegistered → downstream routing |
+
+The Event Grid subscription routes to a Service Bus queue, combining Event Grid push semantics with Service Bus's durable buffer — consumers still pull from the queue.
+
+---
+
+### 6.4 Verify Entra ID authentication locally
+
+#### Step 6.4.1 — Pre-flight: confirm app registration
+
+```powershell
+az account show --query "{name:name, id:id}" -o table
+az ad app list --filter "displayName eq 'AntKart-API-dev'" --query "[].{id:id, appId:appId}" -o table
+az ad app show --id <api_client_id> --query "appRoles[].{id:id, value:value}" -o table
+```
+
+#### Step 6.4.2 — Acquire a token (ROPC flow, dev only)
+
+> ROPC is for local development only. In production, the SPA uses Authorization Code + PKCE.
+
+```powershell
+$TENANT_ID = "4cacc56a-0d38-46c4-ba20-429d51d7b449"
+$CLIENT_ID = "<api_client_id>"
+$USERNAME  = "<user@yourtenantdomain.onmicrosoft.com>"
+$PASSWORD  = "<user_password>"
+$SCOPE     = "api://$CLIENT_ID/access_as_user offline_access"
+
+$body = @{
+    grant_type = "password"
+    client_id  = $CLIENT_ID
+    username   = $USERNAME
+    password   = $PASSWORD
+    scope      = $SCOPE
+}
+
+$response = Invoke-RestMethod `
+    -Method Post `
+    -Uri "https://login.microsoftonline.com/$TENANT_ID/oauth2/v2.0/token" `
+    -Body $body `
+    -ContentType "application/x-www-form-urlencoded"
+
+$TOKEN = $response.access_token
+```
+
+#### Step 6.4.3 — Decode the token and verify claims
+
+```powershell
+$payload = $TOKEN.Split('.')[1]
+$padded  = $payload + ("=" * ((4 - $payload.Length % 4) % 4))
+$claims  = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($padded)) | ConvertFrom-Json
+
+Write-Host "oid (IDOR-safe user ID):  $($claims.oid)"
+Write-Host "roles:                    $($claims.roles)"
+Write-Host "aud (must match Audience): $($claims.aud)"
+Write-Host "iss:                      $($claims.iss)"
+```
+
+Expected: `oid` is a GUID; `roles` contains `user`; `aud` matches `AzureAd.Audience` in appsettings.
+
+#### Step 6.4.4 — Call a protected endpoint
+
+```powershell
+$response = Invoke-RestMethod "http://localhost:5079/api/v1/cart" -Headers @{ Authorization = "Bearer $TOKEN" }
+Write-Host "Cart items: $($response.items.Count)"
+```
+
+---
+
+### 6.5 E2E Platform Test — Full Order Flow
+
+#### Pre-flight checklist
+
+```powershell
+az resource list --resource-group rg-antkart-dev-eastus --query "[].{name:name, type:type}" -o table
+az servicebus queue list --resource-group rg-antkart-dev-eastus --namespace-name sb-antkart-dev --query "[].name" -o tsv
+az keyvault secret list --vault-name kv-antkart-dev --query "[].name" -o tsv
+```
+
+#### Startup sequence (separate terminals)
+
+```powershell
+# Infrastructure (if running locally)
+docker-compose up redis postgres-orders postgres-payments postgres-notifications -d
+
+# Services (one terminal each)
+cd AK.UserIdentity/AK.UserIdentity.API  && dotnet run   # port 5085
+cd AK.Products/AK.Products.API          && dotnet run   # port 5077
+cd AK.ShoppingCart/AK.ShoppingCart.API  && dotnet run   # port 5079
+cd AK.Order/AK.Order.API                && dotnet run   # port 5080
+cd AK.Payments/AK.Payments.API          && dotnet run   # port 5086
+cd AK.Notification/AK.Notification.API  && dotnet run   # port 5087
+cd AK.Gateway/AK.Gateway.API            && dotnet run   # port 8000
+```
+
+#### E2E test script
+
+```powershell
+$AUTH = @{ Authorization = "Bearer $TOKEN" }
+
+# 1. Browse products
+$products = Invoke-RestMethod "http://localhost:5077/api/v1/products?pageSize=5" -Headers $AUTH
+$product  = $products.items[0]
+Write-Host "Products: $($products.totalCount), using: $($product.name)"
+
+# 2. Add to cart
+Invoke-RestMethod -Method Post "http://localhost:5079/api/v1/cart" -Headers $AUTH -ContentType "application/json" `
+    -Body (@{ productId = $product.id; productName = $product.name; unitPrice = $product.price; quantity = 2 } | ConvertTo-Json)
+$cart = Invoke-RestMethod "http://localhost:5079/api/v1/cart" -Headers $AUTH
+Write-Host "Cart items: $($cart.items.Count)"
+
+# 3. Place order
+$order = Invoke-RestMethod -Method Post "http://localhost:5080/api/orders" -Headers $AUTH -ContentType "application/json" `
+    -Body (@{
+        shippingAddress = @{ street = "123 Test St"; city = "Chennai"; state = "Tamil Nadu"; postalCode = "600001"; country = "India" }
+        items = $cart.items | ForEach-Object { @{ productId = $_.productId; productName = $_.productName; quantity = $_.quantity; unitPrice = $_.unitPrice } }
+        totalAmount = ($cart.items | Measure-Object -Property totalPrice -Sum).Sum
+    } | ConvertTo-Json -Depth 5)
+Write-Host "Order: $($order.orderNumber) [$($order.status)]"
+
+# 4. Initiate payment
+$payment = Invoke-RestMethod -Method Post "http://localhost:5086/api/payments" -Headers $AUTH -ContentType "application/json" `
+    -Body (@{ orderId = $order.id; amount = $order.totalAmount; currency = "INR"; description = "Order $($order.orderNumber)" } | ConvertTo-Json)
+Write-Host "Payment: $($payment.razorpayOrderId)"
+
+# 5. Check notifications (allow 5s for Service Bus processing)
+Start-Sleep 5
+$notifications = Invoke-RestMethod "http://localhost:5087/api/notifications/me" -Headers $AUTH
+$notifications.items | ForEach-Object { Write-Host "Notification: $($_.subject) [$($_.status)]" }
+```
+
+Expected: order confirmed, payment initiated, order-confirmation notification delivered.
+
+---
+
+### 6.6 Azure Function local test
+
+#### Configure local.settings.json (gitignored)
+
+`AK.Notification/AK.Notification.Functions/local.settings.json`:
+
+```json
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+    "ServiceBusConnection__fullyQualifiedNamespace": "sb-antkart-dev.servicebus.windows.net"
+  },
+  "ConnectionStrings": {
+    "NotificationsDb": "Host=localhost;Port=5432;Database=AKNotificationsDb;Username=postgres;Password=postgres"
+  }
+}
+```
+
+The double-underscore form (`ServiceBusConnection__fullyQualifiedNamespace`) instructs the Function host to authenticate via `DefaultAzureCredential` instead of a connection string. Locally, `az login` resolves the credential; in Azure, the Function App's managed identity does.
+
+#### Run the Function
+
+```powershell
+cd AK.Notification/AK.Notification.Functions
+dotnet build
+func start
+```
+
+---
+
+### 6.7 Troubleshooting Section 6
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `AADSTS700016: Application not found` | Wrong `ClientId` in appsettings | Copy `api_client_id` from `terragrunt output` exactly |
+| `AADSTS50126: Invalid username or password` | MFA enforced or password hash sync issue | Use a cloud-only Entra user with no MFA policy |
+| `Audience validation failed` | Token `aud` doesn't match `AzureAd.Audience` | Copy `api_audience` from `terragrunt output` exactly |
+| `403` on Graph `/register` | `User.ReadWrite.All` not granted | Azure Portal → AntKart-API → API Permissions → Grant admin consent |
+| `KeyNotFoundException: Role 'user' not found` | `UserRoleId` doesn't match app role GUID | Copy `user_role_id` from `terragrunt output` |
+| Function: `ServiceBusConnection not found` | `local.settings.json` missing | Create file; key must use double underscore |
+| Function: unauthorized on Service Bus | Developer lacks Data Receiver role | `az role assignment create --role "Azure Service Bus Data Receiver" ...` |
+
+---
+
 ## Appendix A — Deploying all dev modules at once
 
 Once you're comfortable with the individual steps, Terragrunt's `run-all` command lets you deploy everything in one command from the environment root:

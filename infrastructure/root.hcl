@@ -183,6 +183,14 @@ generate "provider" {
           source  = "hashicorp/azurerm"
           version = "~> 4.0"
         }
+
+        # hashicorp/azuread manages Microsoft Entra ID (Azure Active Directory) resources:
+        # App Registrations, Service Principals, App Roles, OAuth2 Scopes.
+        # Authenticates with the same ARM_ environment variables as azurerm.
+        azuread = {
+          source  = "hashicorp/azuread"
+          version = "~> 3.0"
+        }
       }
     }
 
@@ -198,5 +206,11 @@ generate "provider" {
       features {}
       subscription_id = "${local.subscription_id}"
     }
+
+    # The azuread provider manages Entra ID (Azure AD) resources independently
+    # of ARM resources. It reads the same ARM_TENANT_ID, ARM_CLIENT_ID,
+    # ARM_CLIENT_SECRET environment variables for Service Principal auth.
+    # No additional credentials are needed beyond what azurerm already uses.
+    provider "azuread" {}
   EOF
 }

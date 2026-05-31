@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>AK.Notification.Functions</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Isolated worker model: .NET 9 process runs outside the Functions host process -->
+    <PackageReference Include="Microsoft.Azure.Functions.Worker" Version="2.0.0" />
+    <PackageReference Include="Microsoft.Azure.Functions.Worker.Sdk" Version="2.0.7" />
+    <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.ServiceBus" Version="5.24.0" />
+    <!-- DefaultAzureCredential for Service Bus + Key Vault access without connection strings -->
+    <PackageReference Include="Azure.Identity" Version="1.16.0" />
+    <!-- DI extensions for the isolated worker host builder -->
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="9.0.4" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="9.0.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Core notification pipeline: MediatR handlers, channels, template renderer -->
+    <ProjectReference Include="..\AK.Notification.Application\AK.Notification.Application.csproj" />
+    <ProjectReference Include="..\AK.Notification.Infrastructure\AK.Notification.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="host.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="local.settings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Never</CopyToPublishDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

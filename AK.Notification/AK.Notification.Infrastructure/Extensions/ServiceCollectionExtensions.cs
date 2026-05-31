@@ -16,7 +16,11 @@ namespace AK.Notification.Infrastructure.Extensions;
 
 public static class ServiceCollectionExtensions
 {
-    public static IServiceCollection AddInfrastructure(
+    // Core infrastructure: PostgreSQL, all notification channels, template renderer, cleanup service.
+    // Called by both the Notification API service and the Azure Function host — neither needs
+    // to know about MassTransit consumers (the API registers them below; the Function uses a
+    // Service Bus trigger annotation instead).
+    public static IServiceCollection AddInfrastructureCore(
         this IServiceCollection services,
         IConfiguration configuration)
     {
@@ -39,6 +43,18 @@ public static class ServiceCollectionExtensions
 
         services.Configure<EmailSettings>(configuration.GetSection("EmailSettings"));
         services.Configure<NotificationSettings>(configuration.GetSection("NotificationSettings"));
+
+        return services;
+    }
+
+    // Full infrastructure including MassTransit consumers on the Service Bus subscription.
+    // Used by the Notification API service (docker-compose / AKS deployment).
+    // The Azure Function uses AddInfrastructureCore() only — it receives messages via trigger.
+    public static IServiceCollection AddInfrastructure(
+        this IServiceCollection services,
+        IConfiguration configuration)
+    {
+        services.AddInfrastructureCore(configuration);
 
         services.AddServiceBusMassTransit(configuration, "notification", cfg =>
         {

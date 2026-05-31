@@ -18,10 +18,10 @@ AntKart/
 ├── AK.Discount/          gRPC service — discount coupons (SQLite)
 ├── AK.ShoppingCart/      REST Minimal API — shopping cart (Redis)
 ├── AK.Order/             REST Minimal API — order management (PostgreSQL + SAGA)
-├── AK.UserIdentity/      REST Minimal API — Keycloak identity proxy
+├── AK.UserIdentity/      REST Minimal API — Entra ID / Microsoft Graph proxy
 ├── AK.Gateway/           API Gateway — Ocelot single entry point
 ├── AK.Payments/          REST Minimal API — payment processing (PostgreSQL + Razorpay)
-├── AK.Notification/      REST Minimal API — transactional notifications (PostgreSQL + Mailhog/SMTP)
+├── AK.Notification/      REST Minimal API + Azure Function — transactional notifications (PostgreSQL + Mailhog/SMTP)
 ├── AK.BuildingBlocks/    Shared cross-cutting library (no business logic)
 ├── AK.IntegrationTests/  SAGA + event bus + notification consumer tests (no API/Grpc dependency)
 ├── AntKart.sln
@@ -106,14 +106,17 @@ AK.<Service>/
 - **Swagger:** `http://localhost:5080/swagger` (Development only)
 - **Design doc:** [AK.Order/ORDER_TECHNICAL_DESIGN.md](AK.Order/ORDER_TECHNICAL_DESIGN.md)
 
-### ✅ AK.UserIdentity  (REST Minimal API — Keycloak Proxy)
+### ✅ AK.UserIdentity  (REST Minimal API — Entra ID / Graph Proxy)
 - **Transport:** HTTP REST, port 5085 (dev) / 8084 (Docker)
-- **Identity Provider:** Keycloak 24.0 — realm `antkart`, client `antkart-client` (confidential, service accounts enabled)
-- **Architecture:** Single API project — thin proxy, no domain layer needed
-- **Roles:** `user` (standard), `admin` (full access)
+- **Identity Provider:** Microsoft Entra ID (Azure AD) — tenant `4cacc56a-0d38-46c4-ba20-429d51d7b449`, app registration `AntKart-API-dev`; replaces Keycloak from Week 6 onward
+- **Architecture:** Single API project — thin proxy; calls Entra ID ROPC token endpoint + Microsoft Graph API for admin operations
+- **Roles:** `user` (standard), `admin` (full access) — expressed as Entra ID app roles; appear as `roles` claims in JWT
 - **Endpoints:** POST /login, POST /register, POST /refresh, GET /me, GET /admin/users, POST /admin/users/{id}/roles
-- **Auth:** JWT Bearer validated against Keycloak OIDC discovery endpoint
-- **Tests:** 20 passing (KeycloakService, KeycloakAdminService, ExceptionHandlerMiddleware — all mocked HTTP; includes RegisterAsync publish + conflict tests, GetAdminTokenAsync, AssignRole step-2 failure, GetUsers missing optional fields)
+- **Services:** `EntraIdService : IIdentityService` (login, register, refresh, me), `EntraIdAdminService : IIdentityAdminService` (list users, assign role via Graph API)
+- **Register flow:** `EntraIdService.RegisterAsync` → app token (client credentials) → `POST /v1.0/users` → `POST /v1.0/users/{id}/appRoleAssignments` → publish `UserRegisteredIntegrationEvent`
+- **GetUserInfo:** Decodes JWT payload locally (base64url) — reads `oid`, `preferred_username`, `email`, `given_name`, `family_name`, `roles`; no network call
+- **Auth:** JWT Bearer validated against Entra ID OIDC discovery endpoint
+- **Tests:** 20 passing (EntraIdService, EntraIdAdminService, ExceptionHandlerMiddleware — all mocked HTTP; includes RegisterAsync publish + conflict tests, GetAdminTokenAsync, AssignRole step-2 failure, GetUsers missing optional fields)
 - **Swagger:** `http://localhost:5085/swagger` (Development only)
 - **Design doc:** [AK.UserIdentity/IDENTITY_TECHNICAL_DESIGN.md](AK.UserIdentity/IDENTITY_TECHNICAL_DESIGN.md)
 
@@ -130,9 +133,9 @@ AK.<Service>/
 - `Logging/SerilogExtensions` — Serilog with console + rolling file + Elasticsearch sink
 - `HealthChecks/HealthCheckExtensions` — `/health` endpoint
 - `Middleware/CorrelationIdMiddleware` — `X-Correlation-Id` header
-- `Authentication/AuthenticationExtensions` — `AddKeycloakAuthentication()` + `UseKeycloakAuth()` shared JWT auth wiring; validates `azp` claim against `settings.Audience` (`antkart-client`) to prevent cross-client token reuse; logs `JsonException` on malformed `realm_access` claim
-- `Authentication/KeycloakSettings` — typed config record for Keycloak settings
-- `Authentication/HttpContextExtensions` — `GetUserId()` extracts `sub` from JWT; `GetUserEmail()` reads `email`/`ClaimTypes.Email`; `GetUserDisplayName()` reads `name`/`given_name`+`family_name`/`preferred_username`
+- `Authentication/AuthenticationExtensions` — `AddEntraIdAuthentication()` + `UseEntraIdAuth()` shared JWT auth wiring (replaces Keycloak methods from Week 6); authority is Entra ID OIDC endpoint; `ValidateAudience = true`; `OnTokenValidated` maps `roles` claims → `ClaimTypes.Role`
+- `Authentication/AzureAdSettings` — typed config record (`TenantId`, `ClientId`, `Audience`); read from `AzureAd` appsettings section; replaces `KeycloakSettings`
+- `Authentication/HttpContextExtensions` — `GetUserId()` reads `oid` claim (Entra Object ID, stable across apps — IDOR-safe); falls back to long-form objectidentifier URI; `GetUserEmail()` reads `email`/`ClaimTypes.Email`; `GetUserDisplayName()` reads `name`/`given_name`+`family_name`/`preferred_username`
 - `DDD/IDomainEvent` — shared marker interface implemented by all domain event records (Products, Order, Payments)
 - `DDD/IAggregateRoot` — shared marker interface identifying aggregate root entities
 - `DDD/Entity` — shared abstract base for Guid-keyed entities (Order, Payments, Notification): `Guid Id`, `DateTimeOffset CreatedAt`, `DateTimeOffset? UpdatedAt`, `AddDomainEvent()`, `ClearDomainEvents()`, `SetUpdatedAt()`
@@ -177,11 +180,21 @@ AK.<Service>/
 - **Patterns:** CQRS (MediatR 12.4.1), FluentValidation, MassTransit consumers, channel abstraction
 - **Channel abstraction:** `INotificationChannel` interface resolved by `INotificationChannelResolver`; Email fully implemented (MailKit); SMS + WhatsApp are stubbed for future activation
 - **Events consumed:** `UserRegisteredIntegrationEvent` (welcome email), `OrderCreatedIntegrationEvent` (order confirmation), `OrderConfirmedIntegrationEvent` (stock confirmed), `OrderCancelledIntegrationEvent` (cancellation notice), `PaymentSucceededIntegrationEvent` (payment receipt), `PaymentFailedIntegrationEvent` (payment failure alert)
+- **Infrastructure split:** `AddInfrastructureCore()` registers PostgreSQL, channels, template renderer, cleanup service (no MassTransit); `AddInfrastructure()` calls core + adds MassTransit with all 6 consumers. The Azure Function project calls only `AddInfrastructureCore()`.
 - **Retention:** `NotificationCleanupService` (BackgroundService) deletes notifications older than 90 days, runs daily at 02:00 UTC
 - **Gateway routes:** `GET /gateway/notifications/{everything}` — authenticated, 20 RPS rate limit
 - **Tests:** 37 passing (domain, command handler, query handlers, consumers, template renderer)
 - **Swagger:** `http://localhost:5087/swagger` (Development only)
 - **Design doc:** [AK.Notification/NOTIFICATION_TECHNICAL_DESIGN.md](AK.Notification/NOTIFICATION_TECHNICAL_DESIGN.md)
+
+### ✅ AK.Notification.Functions  (Azure Function — isolated worker)
+- **Trigger:** Azure Service Bus topic `integration-events`, subscription `notification-subscription`
+- **Runtime:** Azure Functions isolated worker, `net9.0`, Worker SDK 2.0.7 (2.x required for net9.0 — 1.x SDK targets only list net5–net8)
+- **Auth:** `DefaultAzureCredential` via `ServiceBusConnection__fullyQualifiedNamespace` setting (double-underscore form enables token auth; no connection string)
+- **DI:** `AddApplication()` + `AddInfrastructureCore()` — no MassTransit (the Service Bus trigger replaces the consumer)
+- **Purpose:** Demonstrates scale-to-zero serverless event handling; processes `OrderCreatedIntegrationEvent` identically to `OrderCreatedConsumer` by delegating to `SendNotificationCommand` via MediatR
+- **Local testing:** Requires Azure Functions Core Tools (`func start`); `local.settings.json` (gitignored) with `ServiceBusConnection__fullyQualifiedNamespace`
+- **Project:** `AK.Notification/AK.Notification.Functions/`
 
 ---
 
@@ -190,7 +203,7 @@ AK.<Service>/
 ### User Identity — Never Trust the Client
 - **Never** accept `userId` as a URL path parameter or request body field for user-scoped operations
 - **Always** derive the authenticated user's ID from the JWT via `http.GetUserId()` (BuildingBlocks `HttpContextExtensions`)
-- `GetUserId()` reads the `sub` claim (Keycloak UUID); falls back to `preferred_username`; throws `UnauthorizedAccessException` if neither is present
+- `GetUserId()` reads the `oid` claim (Entra ID Object ID — stable across all apps in the tenant); falls back to the long-form objectidentifier URI; throws `UnauthorizedAccessException` if neither is present. Note: Entra uses `oid` (not `sub`, which is pairwise per-app) — this is the IDOR-safe identifier.
 - `UnauthorizedAccessException` maps to HTTP 403 in all `ExceptionHandlerMiddleware` implementations
 
 ### Route Patterns for User-Scoped Data
@@ -432,7 +445,7 @@ Phase 2 moves AntKart from Docker Compose to Azure. Infrastructure lives in `inf
 
 ```
 infrastructure/
-├── root.hcl                          ← Root config: backend (Azure Blob Storage) + provider (azurerm ~> 4.0)
+├── root.hcl                          ← Root config: backend (Azure Blob Storage) + providers (azurerm ~> 4.0, azuread ~> 3.0)
 ├── modules/                          ← Reusable, environment-agnostic modules
 │   ├── resource-group/               ✅ DONE — prevent_destroy = true
 │   ├── networking/                   ✅ DONE — VNet, 3 subnets, 2 NSGs
@@ -442,7 +455,9 @@ infrastructure/
 │   ├── app-insights/                 ✅ DONE — workspace-based (linked to log-analytics)
 │   ├── cosmosdb/                     ✅ DONE — MongoDB API, Serverless, prevent_destroy = true; writes connection string to KV
 │   ├── servicebus/                   ✅ DONE — Standard SKU; order-commands queue, integration-events topic + 2 subscriptions; writes connection string to KV
-│   └── identity/                     ✅ DONE — User-Assigned Managed Identity mi-ak-products-dev; Key Vault Secrets User + Service Bus Data Owner role assignments; outputs client_id/principal_id for Week 7 Workload Identity federation
+│   ├── identity/                     ✅ DONE — User-Assigned Managed Identity mi-ak-products-dev; Key Vault Secrets User + Service Bus Data Owner role assignments; outputs client_id/principal_id for Week 7 Workload Identity federation
+│   ├── entra-id/                     ✅ DONE — azuread_application (AntKart-API: app roles user/admin, OAuth2 scope access_as_user) + azuread_application (AntKart-SPA client) + service principals + delegated permission grant; stable role GUIDs in variables.tf
+│   └── eventgrid/                    ✅ DONE — azurerm_eventgrid_topic + event subscription routing AntKart.UserRegistered → Service Bus queue user-registered-events
 └── environments/
     ├── dev/
     │   ├── env.hcl                   ← Dev values: location=eastus, network_octet=0
@@ -454,7 +469,9 @@ infrastructure/
     │   ├── app-insights/             ✅ deployed — appi-antkart-dev
     │   ├── cosmosdb/                 ✅ wired — deploy: cd environments/dev/cosmosdb && terragrunt apply
     │   ├── servicebus/               ✅ wired — deploy: cd environments/dev/servicebus && terragrunt apply
-    │   └── identity/                 ✅ wired — deploy: cd environments/dev/identity && terragrunt apply (creates mi-ak-products-dev + RBAC grants)
+    │   ├── identity/                 ✅ wired — deploy: cd environments/dev/identity && terragrunt apply (creates mi-ak-products-dev + RBAC grants)
+    │   ├── entra-id/                 ✅ wired — deploy: cd environments/dev/entra-id && terragrunt apply (tenant-scoped; no RG dependency)
+    │   └── eventgrid/                ✅ wired — deploy: cd environments/dev/eventgrid && terragrunt apply (depends on servicebus for queue ID)
     ├── staging/env.hcl               ← TODO (network_octet=1)
     └── prod/env.hcl                  ← TODO (network_octet=2)
 ```

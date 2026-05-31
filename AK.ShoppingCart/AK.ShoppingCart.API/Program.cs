@@ -14,7 +14,7 @@ builder.AddSerilogLogging();
 
 builder.Services.AddApplication();
 builder.Services.AddInfrastructure(builder.Configuration);
-builder.Services.AddKeycloakAuthentication(builder.Configuration);
+builder.Services.AddEntraIdAuthentication(builder.Configuration);
 builder.Services.AddDefaultHealthChecks();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
@@ -50,7 +50,7 @@ app.UseMiddleware<ExceptionHandlerMiddleware>();
 
 app.UseSwaggerInDevelopment("AK.ShoppingCart API v1");
 
-app.UseKeycloakAuth();
+app.UseEntraIdAuth();
 
 app.MapCartEndpoints();
 app.MapDefaultHealthChecks();

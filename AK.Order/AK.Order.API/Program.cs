@@ -25,8 +25,8 @@ builder.Services.AddApplication();
 // AddInfrastructure: EF Core (PostgreSQL), repositories, MassTransit (RabbitMQ + SAGA + Outbox)
 builder.Services.AddInfrastructure(builder.Configuration);
 
-// AddKeycloakAuthentication: JWT Bearer middleware, role extraction, admin/authenticated policies
-builder.Services.AddKeycloakAuthentication(builder.Configuration);
+// AddEntraIdAuthentication: JWT Bearer middleware backed by Entra ID, role extraction, admin/authenticated policies
+builder.Services.AddEntraIdAuthentication(builder.Configuration);
 
 // API versioning: default v1.0, URL segment (/api/v1/...) or header (api-version: 1.0).
 // Other services adopt this by calling AddStandardApiVersioning() in their Program.cs.
@@ -75,9 +75,9 @@ app.UseMiddleware<ExceptionHandlerMiddleware>();
 
 app.UseSwaggerInDevelopment("AK.Order API v1");
 
-// UseKeycloakAuth calls UseAuthentication() then UseAuthorization() in the correct order.
+// UseEntraIdAuth calls UseAuthentication() then UseAuthorization() in the correct order.
 // Must come AFTER ExceptionHandlerMiddleware (so auth errors are caught) and BEFORE endpoint mapping.
-app.UseKeycloakAuth();
+app.UseEntraIdAuth();
 
 app.MapOrderEndpoints();
 app.MapDefaultHealthChecks();
