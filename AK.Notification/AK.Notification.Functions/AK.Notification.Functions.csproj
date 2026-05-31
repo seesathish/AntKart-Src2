@@ -15,6 +15,9 @@
     <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.ServiceBus" Version="5.24.0" />
     <!-- DefaultAzureCredential for Service Bus + Key Vault access without connection strings -->
     <PackageReference Include="Azure.Identity" Version="1.16.0" />
+    <!-- Pin EF Core 9.0.4: Functions Worker SDK pulls 9.0.1 as a transitive dep -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore" Version="9.0.4" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="9.0.4" />
     <!-- DI extensions for the isolated worker host builder -->
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="9.0.4" />
     <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="9.0.4" />

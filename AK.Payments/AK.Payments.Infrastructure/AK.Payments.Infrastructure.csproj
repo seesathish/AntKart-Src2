@@ -3,6 +3,8 @@
     <TargetFramework>net9.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- NU1701: Razorpay 3.1.0 targets .NET Framework only; works via compatibility shim on .NET 9 -->
+    <NoWarn>$(NoWarn);NU1701</NoWarn>
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="AK.Payments.Tests" />
@@ -14,6 +16,8 @@
   <ItemGroup>
     <PackageReference Include="MassTransit" Version="8.3.6" />
     <PackageReference Include="MassTransit.EntityFrameworkCore" Version="8.3.6" />
+    <!-- Pin EF Core 9.0.4 explicitly: MassTransit.EntityFrameworkCore 8.3.6 pulls 9.0.1 as a transitive dep -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="9.0.4" />
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="9.0.4" />
     <PackageReference Include="Razorpay" Version="3.1.0" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="9.0.4">

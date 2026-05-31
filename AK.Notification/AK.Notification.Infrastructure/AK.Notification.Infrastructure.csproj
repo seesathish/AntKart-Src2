@@ -11,7 +11,7 @@
     <ProjectReference Include="..\AK.Notification.Application\AK.Notification.Application.csproj" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="MailKit" Version="4.10.0" />
+    <PackageReference Include="MailKit" Version="4.17.0" />
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="9.0.4" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="9.0.4">
       <PrivateAssets>all</PrivateAssets>
@@ -19,6 +19,8 @@
     </PackageReference>
     <PackageReference Include="MassTransit" Version="8.3.6" />
     <PackageReference Include="MassTransit.EntityFrameworkCore" Version="8.3.6" />
+    <!-- Pin EF Core 9.0.4 explicitly: MassTransit.EntityFrameworkCore 8.3.6 pulls 9.0.1 as a transitive dep -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="9.0.4" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.4" />
   </ItemGroup>
 </Project>
