@@ -1845,6 +1845,341 @@ After destroying and recreating, MassTransit will re-create its topics and subsc
 
 ---
 
+## Section 5: Migrating Products to Cosmos DB and Establishing Workload Identity
+
+### What you're about to do
+
+In this section you'll migrate AK.Products from a local MongoDB Docker container to **Azure Cosmos DB (MongoDB API)** — the managed database provisioned in Week 3. You'll also learn how the application retrieves the Cosmos connection string from **Azure Key Vault** at startup using `DefaultAzureCredential`, and why this is different from how Service Bus auth works. Finally, you'll provision the **User-Assigned Managed Identity** that AK.Products will use in AKS (Week 7), and understand what Workload Identity is and why it eliminates secrets from pods entirely.
+
+---
+
+### 5.1 Understanding Cosmos DB for MongoDB API
+
+Azure Cosmos DB is Microsoft's globally-distributed, multi-model NoSQL database. It supports multiple wire protocols as its "API" layer — Core SQL (native), MongoDB, Cassandra, Gremlin, and Table. AntKart uses **MongoDB API**, meaning the Azure SDK never appears in application code. The MongoDB .NET Driver (`MongoDB.Driver`) connects to Cosmos DB exactly as it would to a real MongoDB instance.
+
+#### The MongoDB API compatibility contract
+
+The MongoDB API provides **wire-protocol compatibility** — your `MongoClient`, `IMongoCollection`, filter builders, and LINQ queries work without modification. Cosmos DB understands the MongoDB wire protocol and responds as a MongoDB server would.
+
+What changes is only the **connection string** (pointing at `cosmos-antkart-dev.mongo.cosmos.azure.com` instead of `localhost:27017`) and some **behavioural differences** you need to be aware of:
+
+| Feature | Native MongoDB | Cosmos MongoDB API |
+|---------|---------------|-------------------|
+| Default indexing | `_id` only | All fields (wildcard) |
+| Text indexes | Multiple allowed | **One per collection** |
+| Retryable writes | Supported | Must set `retrywrites=false` (in connection string) |
+| Transactions | Replica set required | Supported on serverless (limited) |
+| `$lookup` (joins) | Supported | Partially supported |
+| Authentication | Username/password or X.509 | Connection string with account key **or** Azure AD (limited) |
+| Connection pooling | Standard | **Singleton MongoClient required** — Cosmos throttles connection churn |
+
+The key differences for AntKart:
+- The existing `CreateIndexes()` method creates exactly one text index — within Cosmos's limit.
+- `retrywrites=false` is embedded in the Cosmos connection string automatically — the driver reads it.
+- `MongoClient` is registered as a **singleton** in DI — one connection pool per process, never re-created.
+
+#### Serverless billing model
+
+Cosmos DB in serverless mode charges per **Request Unit (RU)**. A Request Unit is a normalised measure of compute, memory, and I/O for one database operation. Rules of thumb:
+
+| Operation | Approximate RU cost |
+|-----------|-------------------|
+| Read one document by `_id` | ~1 RU |
+| Read one document by indexed field | ~1–3 RU |
+| Read one document by unindexed field (full scan) | Proportional to collection size |
+| Insert one document | ~5–10 RU |
+| Replace one document | ~10 RU |
+| Text search query | ~10–50 RU depending on result set |
+| Cross-partition query (no filter on shard key) | Multiplied by partition count |
+
+**For AntKart dev:** seed 300 products + typical dev queries ≈ negligible cost. Serverless charges begin only when requests arrive. No idle cost.
+
+**RU spike risk:** `GetAllAsync()` and unfiltered `ListAsync()` fetch every document — ~300 documents × ~1 RU = ~300 RU per call. Add an index on `CategoryName` (already done) to make filtered queries cheap. The cross-partition text search is the highest-cost query; acceptable at AntKart's scale.
+
+#### Partition strategy
+
+In Cosmos DB, data is distributed across physical partitions by a **shard key** (called partition key). In serverless mode, Cosmos handles this internally — you don't specify a shard key in the driver code. Cosmos uses `_id` as the default routing key, which means each document is effectively in its own logical partition.
+
+If AntKart ever moves to **provisioned throughput** (fixed RU/s instead of serverless), the right shard key for the products collection would be `CategoryName` ("Men", "Women", "Kids"). Why:
+- Each category has enough documents to form a hot enough partition (~100 products each).
+- Most queries filter by `CategoryName` — a shard key match means the query hits exactly one partition (cheap).
+- Cross-partition queries (`GetAllAsync`) would still work but cost more — acceptable for an admin operation.
+
+For serverless: no action needed. Document this for future reference only.
+
+---
+
+### 5.2 The Key Vault connection pattern — and why it differs from Service Bus
+
+After Week 4, you might ask: *"Service Bus uses DefaultAzureCredential directly with no connection string. Why can't Cosmos do the same?"*
+
+The answer is in the authentication model each service supports at the wire-protocol level.
+
+#### Service Bus token auth (clean, keyless)
+
+Azure Service Bus natively supports **Azure Active Directory token authentication** on its AMQP protocol:
+
+```
+MassTransit SDK → DefaultAzureCredential → Azure AD → Access Token → Service Bus
+```
+
+The token is short-lived (1 hour TTL), auto-refreshed, and no key ever leaves Azure AD. This is pure identity-based access. We set `h.TokenCredential = new DefaultAzureCredential()` and that is everything.
+
+#### Cosmos MongoDB API — connection string authentication
+
+Azure Cosmos DB MongoDB API uses the **MongoDB wire protocol** (`mongo://` handshake). The MongoDB wire protocol authenticates using **SCRAM-SHA-256** (username + password challenge-response). The "password" is the Cosmos account key embedded in the connection string:
+
+```
+mongodb://cosmos-antkart-dev:<account-key>@cosmos-antkart-dev.mongo.cosmos.azure.com:10255/?ssl=true&...
+```
+
+Azure AD token auth for Cosmos MongoDB API exists but is only available through specific Azure SDK clients (like `CosmosClient` for the Core SQL API), **not** through the MongoDB wire protocol. The `MongoDB.Driver` package communicates exclusively via the MongoDB wire protocol. It cannot use Azure AD tokens for auth — it speaks SCRAM, not OAuth.
+
+Therefore:
+- We cannot pass `DefaultAzureCredential` to `MongoClient` the way we do for Service Bus.
+- The account key must exist somewhere the application can read it at startup.
+- The secure solution: **store it in Key Vault** and retrieve it using `DefaultAzureCredential` at startup.
+
+```
+App startup → DefaultAzureCredential → Key Vault → Cosmos connection string → MongoClient
+                        ↑
+              (this step uses token auth)
+```
+
+Token auth is used for the Key Vault call. The Cosmos connection uses the retrieved key. The key never appears in source control, config files, or environment variables set by the developer. This is the pragmatic, secure approach for a database that doesn't support token auth on its wire protocol.
+
+#### What goes in appsettings
+
+```json
+"CosmosDb": {
+  "KeyVaultUri": "https://kv-antkart-dev.vault.azure.net/",
+  "SecretName":  "cosmos-connection-string"
+}
+```
+
+Neither of these is sensitive. In AKS, they will be injected via a **Kubernetes ConfigMap** (not a Secret), confirming that they are not treated as sensitive values.
+
+The actual connection string is fetched at runtime, lives only in `MongoClient`'s internal state, and is never written to any output.
+
+---
+
+### 5.3 Understanding Workload Identity — the secret-less future
+
+The goal of Weeks 4–7 is to eliminate secrets from the application entirely. Week 4 achieved this for Service Bus (token auth). Week 5 achieves the Key Vault fetch (token auth) and creates the managed identity infrastructure. Week 7 completes the picture by federating the identity to AKS pods.
+
+#### What is a Managed Identity?
+
+A Managed Identity is an Azure Active Directory application registration whose lifecycle and credentials are managed by Azure. You never see a client secret for a managed identity — Azure rotates them automatically, internally. You can't accidentally commit them.
+
+There are two types:
+
+| Type | Lifecycle | Kubernetes support | Use case |
+|------|-----------|-------------------|----------|
+| System-Assigned | Tied to the host resource (VM, App Service) | Not usable for Workload Identity | Simple scenarios, VMs |
+| User-Assigned | Independent resource, stable `client_id` | **Required for Workload Identity** | AKS pods, cross-resource scenarios |
+
+AntKart uses **User-Assigned Managed Identities** because Workload Identity federation requires a stable `client_id` that exists before the pod starts.
+
+#### What is OIDC federation?
+
+When AKS is provisioned (Week 7), it exposes an **OIDC issuer URL** — an endpoint that serves a JSON Web Key Set (JWKS). This key set allows any verifier to confirm: *"Yes, this JWT token was issued by this AKS cluster to this Kubernetes service account."*
+
+A **Federated Credential** is a rule on the Managed Identity that says:
+
+> "If you present me a token from OIDC issuer `https://aks-cluster.oidc.example.com/`, issued to the service account `system:serviceaccount:ak-products:ak-products-sa`, I'll accept it as proof of identity for this managed identity."
+
+When a pod starts in AKS with Workload Identity configured:
+1. AKS injects a short-lived service account token file into the pod.
+2. The pod's environment gets `AZURE_FEDERATED_TOKEN_FILE` pointing at the token file.
+3. `DefaultAzureCredential` reads that file and presents the token to Azure AD.
+4. Azure AD validates the token (via the cluster's OIDC endpoint) and returns a short-lived Azure access token.
+5. The application now has Azure access — no secret, no rotation, no vault read needed for auth itself.
+
+#### The DefaultAzureCredential payoff
+
+Here is the same code that has been in `MassTransitExtensions.cs` since Week 4, and in `ServiceCollectionExtensions.cs` since Week 5:
+
+```csharp
+new DefaultAzureCredential()
+```
+
+| Where code runs | What DefaultAzureCredential picks up | Secret involved? |
+|----------------|--------------------------------------|-----------------|
+| Developer laptop | `AzureCliCredential` → your `az login` session | No |
+| AKS pod (Week 7) | `WorkloadIdentityCredential` → projected service account token | No |
+| Azure VM / App Service | `ManagedIdentityCredential` → system-assigned identity | No |
+| CI/CD pipeline | `EnvironmentCredential` → `ARM_CLIENT_ID` + `ARM_CLIENT_SECRET` env vars | Client secret (short-lived) |
+
+The same single line of code works in all four environments. The credential source changes; the code does not. This is the design payoff of the enterprise authentication pattern.
+
+#### What Week 5 creates in Terraform
+
+Running the identity module deploys:
+
+```
+mi-ak-products-dev  (User-Assigned Managed Identity)
+    │
+    ├── Key Vault Secrets User  →  kv-antkart-dev
+    │   └── Can read:  cosmos-connection-string
+    │                  servicebus-connection-string
+    │                  (any other secrets added later)
+    │
+    └── Azure Service Bus Data Owner  →  sb-antkart-dev
+        └── Can: Manage topics/subscriptions (auto-topology)
+                 Send messages (publish integration events)
+                 Listen for messages (consume integration events)
+```
+
+Week 7 adds the federation link:
+
+```
+mi-ak-products-dev
+    └── Federated Credential: AKS OIDC issuer ↔ system:serviceaccount:ak-products:ak-products-sa
+```
+
+After that: the pod reads Key Vault, sends/receives messages — with no secrets, no rotation, no service principal passwords.
+
+---
+
+### 5.4 Step-by-step: Grant local developer access and run Products against Cosmos
+
+Before running AK.Products locally against Cosmos, your developer identity needs permission to read the Key Vault secret.
+
+#### Step 5.1 — Verify your az login session
+
+```powershell
+az account show --query "{subscription:name, user:user.name}" -o table
+```
+
+Expected output shows your subscription and your email address. If not:
+```powershell
+az login
+az account set --subscription "1a69c45b-82ed-4ec6-972e-c9a5933e6fd0"
+```
+
+#### Step 5.2 — Check your existing Key Vault access
+
+From Week 2 setup, you may already have `Key Vault Secrets Officer` on `kv-antkart-dev`. Officer is a superset of User — if you have Officer, skip Step 5.3.
+
+```powershell
+# Get your signed-in user's object ID
+$MY_OBJECT_ID = az ad signed-in-user show --query id -o tsv
+
+# Check existing assignments on the Key Vault
+az role assignment list `
+  --assignee $MY_OBJECT_ID `
+  --scope "/subscriptions/1a69c45b-82ed-4ec6-972e-c9a5933e6fd0/resourceGroups/rg-antkart-dev-eastus/providers/Microsoft.KeyVault/vaults/kv-antkart-dev" `
+  --query "[].roleDefinitionName" `
+  -o table
+```
+
+If you see `Key Vault Secrets Officer` or `Key Vault Administrator` — you already have access. Jump to Step 5.4.
+
+#### Step 5.3 — Grant Key Vault Secrets User (if needed)
+
+```powershell
+$MY_OBJECT_ID = az ad signed-in-user show --query id -o tsv
+
+az role assignment create `
+  --assignee $MY_OBJECT_ID `
+  --role "Key Vault Secrets User" `
+  --scope "/subscriptions/1a69c45b-82ed-4ec6-972e-c9a5933e6fd0/resourceGroups/rg-antkart-dev-eastus/providers/Microsoft.KeyVault/vaults/kv-antkart-dev"
+```
+
+RBAC propagation takes up to 5 minutes. Continue to Step 5.4 while waiting.
+
+#### Step 5.4 — Verify you can read the secret
+
+This is the exact call AK.Products makes at startup:
+
+```powershell
+az keyvault secret show `
+  --vault-name kv-antkart-dev `
+  --name cosmos-connection-string `
+  --query value -o tsv
+```
+
+Expected output: a long MongoDB connection string starting with `mongodb://`. If you see an error:
+- `(Forbidden)` — RBAC not yet propagated. Wait 5 more minutes and retry.
+- `(SecretNotFound)` — the Cosmos Terraform module was not applied. Run `cd infrastructure/environments/dev/cosmosdb && terragrunt apply`.
+
+#### Step 5.5 — Deploy the identity module (Workload Identity foundation)
+
+This creates `mi-ak-products-dev` and grants it the needed RBAC roles:
+
+```powershell
+cd infrastructure/environments/dev/identity
+terragrunt init
+terragrunt plan   # Review the 3 resources: identity + 2 role assignments
+terragrunt apply
+```
+
+Note the outputs — you'll use them in Week 7:
+```
+outputs:
+  products_client_id     = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+  products_principal_id  = "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+  products_identity_id   = "/subscriptions/.../.../mi-ak-products-dev"
+  products_identity_name = "mi-ak-products-dev"
+```
+
+#### Step 5.6 — Run AK.Products against Cosmos DB
+
+```powershell
+# Start only the infrastructure services AK.Products depends on locally
+# (Keycloak for auth, the rest are not needed for Products alone)
+docker-compose up keycloak -d
+
+# Run AK.Products
+cd AK.Products/AK.Products.API
+dotnet run
+```
+
+Watch the startup logs. You should see:
+```
+info: AK.Products.Infrastructure[0]
+      Fetching Cosmos DB connection string from Key Vault...
+[17:xx:xx INF] MongoDbContext initialised — creating indexes on "antkart-products"."products"
+[17:xx:xx INF] Seeding 300 products into Cosmos DB...
+[17:xx:xx INF] Now listening on: http://localhost:5077
+```
+
+After startup, open `http://localhost:5077/swagger` and test:
+- `GET /api/v1/products` — should return 300 products from Cosmos
+- `GET /api/v1/products/categories` — should return `["Kids", "Men", "Women"]`
+- `GET /api/v1/products?category=Men` — should return ~100 Men's products
+
+#### Step 5.7 — Verify in Azure portal
+
+1. Go to **Cosmos DB → cosmos-antkart-dev → Data Explorer**
+2. Expand `antkart-products` → `products`
+3. You should see 300 documents
+
+---
+
+### 5.5 Data migration note
+
+AntKart's local MongoDB database (`AKProductsDb`) contains 300 seeded products. The Cosmos database (`antkart-products`) starts empty. When AK.Products starts and `SEED_DATABASE=true` (or `IsDevelopment()`), the `ProductSeeder` runs and inserts 300 products into Cosmos directly. **No `mongodump`/`mongorestore` is needed** for dev — the seeder is the source of truth.
+
+For production migrations (if real data existed): use **Azure Database Migration Service** or `mongorestore` with the Cosmos connection string as the target. The MongoDB wire protocol compatibility means `mongorestore` works against Cosmos identically to native MongoDB.
+
+---
+
+### 5.6 Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| `(Forbidden) Access denied` on startup | Developer identity lacks Key Vault Secrets User | Run Step 5.3; wait 5 min for RBAC propagation |
+| `SecretNotFound: cosmos-connection-string` | Cosmos Terraform module not applied | `cd environments/dev/cosmosdb && terragrunt apply` |
+| `InvalidOperationException: CosmosDb configuration section is missing` | `appsettings.json` missing `CosmosDb` section | Verify `appsettings.json` has `CosmosDb.KeyVaultUri` and `CosmosDb.SecretName` |
+| `Server selection timed out after 10000ms` | Connection string invalid or network blocked | Verify secret value with `az keyvault secret show`. Check firewall rules on Cosmos account |
+| `MongoCommandException: There can only be one text index per collection` | Second text index creation attempted | Ensure `CreateIndexes()` only creates one text index (the compound Name+Brand+Description one) |
+| `TooManyRequests (429)` from Cosmos | RU limit hit; serverless temporarily throttling | Retry after a moment. For persistent 429s, check for unindexed queries performing full-collection scans |
+| `E11000 duplicate key error collection: products index: sku_unique` | Seeder ran on a non-empty collection with a SKU conflict | The seeder checks count before inserting (`if count >= 300 return`). If partially seeded, manually clear: `db.products.deleteMany({})` in Data Explorer, then restart |
+| Seeder runs but Cosmos has 0 documents | `SEED_DATABASE` not set + not in Development environment | Set `SEED_DATABASE=true` or set `ASPNETCORE_ENVIRONMENT=Development` |
+
+---
+
 ## Appendix A — Deploying all dev modules at once
 
 Once you're comfortable with the individual steps, Terragrunt's `run-all` command lets you deploy everything in one command from the environment root:

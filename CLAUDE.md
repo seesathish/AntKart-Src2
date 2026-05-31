@@ -53,9 +53,10 @@ AK.<Service>/
 
 ### ✅ AK.Products  (REST Minimal API)
 - **Transport:** HTTP REST, port 5077 (dev) / 8080 (Docker)
-- **Database:** MongoDB — `AKProductsDb` / `Products` collection
+- **Database:** Azure Cosmos DB (MongoDB API, Serverless) — database `antkart-products` / collection `products`
 - **Architecture:** DDD + Clean Architecture — `MongoDB.Driver` confined to Infrastructure only; Domain has zero infrastructure dependencies
 - **Patterns:** CQRS (MediatR 12.4.1), FluentValidation pipeline, Specification, Unit of Work
+- **Connection:** Cosmos connection string fetched from Key Vault (`cosmos-connection-string` secret) at startup via `DefaultAzureCredential` + `SecretClient`. No connection string in appsettings — only `CosmosDb:KeyVaultUri` and `CosmosDb:SecretName` (non-secret references). `MongoClient` registered as singleton in DI — critical for Cosmos connection pooling.
 - **Category design:** Data-driven — `CategoryName` (top-level: Men/Women/Kids/Sports/etc.) + `SubCategoryName` (specific: Shirts/Dresses/etc.) are plain strings; no hardcoded enum. Adding a new category is a data change only.
 - **ID format:** `Guid.NewGuid().ToString("N")` — 32-char hex string, pure .NET, stored as BSON string
 - **MongoDB mapping:** `ProductClassMap` (Infrastructure) registers `BsonClassMap<StringEntity>` and `BsonClassMap<Product>` — handles `SetIgnoreExtraElements` and unmaps `DomainEvents`; called before `MongoDbContext` is registered
@@ -63,7 +64,7 @@ AK.<Service>/
 - **SKU format:** `{CAT_ABBREV}-{SUBCAT_ABBREV}-{001..NNN}` e.g. `MEN-SHIR-001`, `WOM-DRES-001`
 - **New endpoint:** `GET /api/v1/products/categories` — returns distinct top-level category names from DB
 - **Removed endpoints:** `/men`, `/women`, `/kids` — replaced by `?category=Men`, `?category=Women`, `?category=Kids`
-- **Tests:** 202 passing (domain, commands, queries, validators, specifications, DTO mapping, GetProductCategories handler, ReserveStockConsumer)
+- **Tests:** 204 passing (domain, commands, queries, validators, specifications, DTO mapping, GetProductCategories handler, ReserveStockConsumer, MongoDbSettings, CosmosDbSettings)
 - **Swagger:** `http://localhost:5077/swagger` (Development only)
 - **Design doc:** [AK.Products/PRODUCTS_TECHNICAL_DESIGN.md](AK.Products/PRODUCTS_TECHNICAL_DESIGN.md)
 
@@ -318,7 +319,8 @@ Always run `dotnet restore` from the repo root so this config is picked up. Neve
 | Serilog.Sinks.Elasticsearch | 9.0.3 | BuildingBlocks |
 | MassTransit | 8.3.6 | BuildingBlocks, Order, Products, ShoppingCart |
 | MassTransit.Azure.ServiceBus.Core | 8.3.6 | AK.BuildingBlocks (transport — replaces MassTransit.RabbitMQ in Week 4) |
-| Azure.Identity | 1.13.2 | AK.BuildingBlocks (DefaultAzureCredential for token-based Service Bus auth) |
+| Azure.Identity | 1.13.2 | AK.BuildingBlocks (DefaultAzureCredential for Service Bus token auth); AK.Products.Infrastructure (DefaultAzureCredential for Key Vault secret fetch in Week 5) |
+| Azure.Security.KeyVault.Secrets | 4.7.0 | AK.Products.Infrastructure (SecretClient to retrieve Cosmos connection string from Key Vault at startup) |
 | MassTransit.EntityFrameworkCore | 8.3.6 | Order Infrastructure (outbox + saga) |
 | Microsoft.Extensions.Http.Resilience | 9.0.0 | BuildingBlocks, Products Infrastructure |
 | Microsoft.Extensions.Resilience | 9.0.0 | BuildingBlocks, Order/ShoppingCart Infrastructure |
@@ -439,7 +441,8 @@ infrastructure/
 │   ├── log-analytics/                ✅ DONE — PerGB2018, 30-day retention
 │   ├── app-insights/                 ✅ DONE — workspace-based (linked to log-analytics)
 │   ├── cosmosdb/                     ✅ DONE — MongoDB API, Serverless, prevent_destroy = true; writes connection string to KV
-│   └── servicebus/                   ✅ DONE — Standard SKU; order-commands queue, integration-events topic + 2 subscriptions; writes connection string to KV
+│   ├── servicebus/                   ✅ DONE — Standard SKU; order-commands queue, integration-events topic + 2 subscriptions; writes connection string to KV
+│   └── identity/                     ✅ DONE — User-Assigned Managed Identity mi-ak-products-dev; Key Vault Secrets User + Service Bus Data Owner role assignments; outputs client_id/principal_id for Week 7 Workload Identity federation
 └── environments/
     ├── dev/
     │   ├── env.hcl                   ← Dev values: location=eastus, network_octet=0
@@ -450,7 +453,8 @@ infrastructure/
     │   ├── log-analytics/            ✅ deployed — log-antkart-dev
     │   ├── app-insights/             ✅ deployed — appi-antkart-dev
     │   ├── cosmosdb/                 ✅ wired — deploy: cd environments/dev/cosmosdb && terragrunt apply
-    │   └── servicebus/               ✅ wired — deploy: cd environments/dev/servicebus && terragrunt apply
+    │   ├── servicebus/               ✅ wired — deploy: cd environments/dev/servicebus && terragrunt apply
+    │   └── identity/                 ✅ wired — deploy: cd environments/dev/identity && terragrunt apply (creates mi-ak-products-dev + RBAC grants)
     ├── staging/env.hcl               ← TODO (network_octet=1)
     └── prod/env.hcl                  ← TODO (network_octet=2)
 ```

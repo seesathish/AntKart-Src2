@@ -419,14 +419,317 @@ These are separate from the Week 3 Terraform-created entities (`order-commands`,
 
 ---
 
+## Week 5 — MongoDB → Cosmos DB Migration + Workload Identity Foundation
+
+Week 5 migrates AK.Products persistence from a local MongoDB Docker container to Azure Cosmos DB (MongoDB API), using a Key Vault-sourced connection string. It also creates the Workload Identity infrastructure (User-Assigned Managed Identity + RBAC grants) that AKS pods will use in Week 7.
+
+**Zero changes to:** ProductRepository, ProductClassMap, ProductSeeder, UnitOfWork, all other services, consumers, SAGA, outbox. The MongoDB Driver API is identical for Cosmos MongoDB API — only the connection bootstrapping changes.
+
+---
+
+### Change 1: NuGet packages added to AK.Products.Infrastructure
+
+**File:** `AK.Products/AK.Products.Infrastructure/AK.Products.Infrastructure.csproj`
+
+**What changed:**
+
+```xml
+<!-- ADDED -->
+<PackageReference Include="Azure.Identity" Version="1.13.2" />
+<PackageReference Include="Azure.Security.KeyVault.Secrets" Version="4.7.0" />
+```
+
+**Reason — `Azure.Identity`:**
+Provides `DefaultAzureCredential`. Used in `ServiceCollectionExtensions` to authenticate to Key Vault when fetching the Cosmos connection string. The same `DefaultAzureCredential` pattern is already used for Service Bus (Week 4). Adding it to Infrastructure directly (rather than relying on the BuildingBlocks reference) makes the dependency explicit.
+
+**Reason — `Azure.Security.KeyVault.Secrets`:**
+Provides `SecretClient` — the Azure SDK client for reading secrets from Key Vault. The Cosmos connection string is stored in Key Vault as `cosmos-connection-string` (written by the Cosmos DB Terraform module in Week 3). `SecretClient` retrieves it at startup using `DefaultAzureCredential`.
+
+---
+
+### Change 2: New file — CosmosDbSettings.cs
+
+**File:** `AK.Products/AK.Products.Infrastructure/Persistence/CosmosDbSettings.cs`
+
+**What was added:**
+
+```csharp
+public sealed class CosmosDbSettings
+{
+    public string KeyVaultUri { get; set; } = string.Empty;
+    public string SecretName  { get; set; } = "cosmos-connection-string";
+}
+```
+
+**Reason — why a separate settings class (not adding to MongoDbSettings):**
+
+`MongoDbSettings` holds database coordinates (name, collection). `CosmosDbSettings` holds Key Vault references — these are logically different concerns. Keeping them separate makes it clear that `MongoDbSettings` properties are non-sensitive (database name and collection name), while `CosmosDbSettings` describes *how to retrieve* the sensitive value (without containing it).
+
+**Reason — why neither property is sensitive:**
+
+- `KeyVaultUri` — the HTTPS endpoint of the Key Vault (e.g. `https://kv-antkart-dev.vault.azure.net/`). This is a public DNS name. Knowing it gives no access without a valid Azure identity.
+- `SecretName` — the name of the secret inside the vault (`cosmos-connection-string`). The name of a secret is not the secret itself.
+
+The actual connection string (which contains the Cosmos account key) never appears in any config file. It is fetched at startup from Key Vault and used only in memory to construct `MongoClient`. It is never written to disk, logs, or environment variables by the application.
+
+**Reason — why `SecretName` defaults to `"cosmos-connection-string"`:**
+
+This matches the name Terraform uses when writing the secret in `infrastructure/modules/cosmosdb/main.tf`. If the name is configured correctly in both places, no manual coordination is needed between Terraform and application deployments.
+
+---
+
+### Change 3: MongoDbSettings.cs — ConnectionString removed, DatabaseName updated
+
+**File:** `AK.Products/AK.Products.Infrastructure/Persistence/MongoDbSettings.cs`
+
+**What changed:**
+
+```csharp
+// BEFORE
+public sealed class MongoDbSettings
+{
+    public string ConnectionString   { get; set; } = "mongodb://localhost:27017";
+    public string DatabaseName       { get; set; } = "ACProductsDb";
+    public string ProductsCollection { get; set; } = "products";
+}
+
+// AFTER
+public sealed class MongoDbSettings
+{
+    public string DatabaseName       { get; set; } = "antkart-products";
+    public string ProductsCollection { get; set; } = "products";
+}
+```
+
+**Reason — ConnectionString removed:**
+
+The Cosmos connection string contains the Cosmos account key. Storing any form of it in a settings class that might be read from config files would risk it appearing in logs, config dumps, or appsettings committed to source control. Removing `ConnectionString` from the class makes it structurally impossible to accidentally put the secret here.
+
+**Reason — DatabaseName changed to `"antkart-products"`:**
+
+`"antkart-products"` is the name of the database provisioned by the Cosmos DB Terraform module in Week 3 (the `database_name` input). The old name `"ACProductsDb"` (a Phase 1 local MongoDB artifact — note also the `"AKProductsDb"` inconsistency in appsettings) is replaced with the actual cloud database name. These must match exactly or Cosmos will create a second, empty database.
+
+---
+
+### Change 4: MongoDbContext.cs — production constructor updated
+
+**File:** `AK.Products/AK.Products.Infrastructure/Persistence/MongoDbContext.cs`
+
+**What changed:**
+
+```csharp
+// BEFORE — production constructor
+public MongoDbContext(IOptions<MongoDbSettings> settings)
+{
+    var client = new MongoClient(settings.Value.ConnectionString);
+    _database = client.GetDatabase(settings.Value.DatabaseName);
+    CreateIndexes();
+}
+
+// AFTER — production constructor
+public MongoDbContext(MongoClient client, IOptions<MongoDbSettings> settings)
+{
+    _database = client.GetDatabase(settings.Value.DatabaseName);
+    CreateIndexes();
+}
+
+// TEST constructor — UNCHANGED in both versions
+public MongoDbContext(IMongoDatabase database)
+{
+    _database = database;
+}
+```
+
+**Reason — why inject `MongoClient` rather than create it internally:**
+
+`MongoClient` internally manages a connection pool. Creating a new `MongoClient` each time `MongoDbContext` is instantiated (even with `AddSingleton`) would work, but extracting `MongoClient` to DI as its own singleton makes the pool ownership explicit and visible. If someone accidentally changes `MongoDbContext` registration from `AddSingleton` to `AddScoped` in the future, having `MongoClient` as a separate singleton ensures the connection pool is still shared across requests.
+
+This also separates concerns: `ServiceCollectionExtensions` owns the credential/connection-string concern (Key Vault, `DefaultAzureCredential`); `MongoDbContext` owns the database+index concern. Each class has one responsibility.
+
+**Reason — test constructor unchanged:**
+
+The test constructor `MongoDbContext(IMongoDatabase database)` accepts a mocked `IMongoDatabase`. All 23 infrastructure test methods use this path. They construct `MongoDbContext` with `Mock<IMongoDatabase>`, bypassing `MongoClient`, Key Vault, and Cosmos entirely. Preserving this constructor means zero changes to tests.
+
+**Cosmos MongoDB API index notes added to comments:**
+- One text index per collection (Cosmos constraint) — the existing single compound text index already satisfies this.
+- All fields indexed by default in Cosmos (unlike native MongoDB) — the explicit indexes supplement this with uniqueness constraint on SKU.
+
+---
+
+### Change 5: ServiceCollectionExtensions.cs — Key Vault secret fetch + MongoClient singleton
+
+**File:** `AK.Products/AK.Products.Infrastructure/Extensions/ServiceCollectionExtensions.cs`
+
+**What changed:**
+
+```csharp
+// BEFORE
+ProductClassMap.Register();
+services.Configure<MongoDbSettings>(configuration.GetSection("MongoDbSettings"));
+services.AddSingleton<MongoDbContext>();   // MongoDbContext constructed MongoClient internally
+
+// AFTER
+ProductClassMap.Register();
+services.Configure<MongoDbSettings>(configuration.GetSection("MongoDbSettings"));
+services.Configure<CosmosDbSettings>(configuration.GetSection("CosmosDb"));
+
+// 1. Fetch connection string from Key Vault (once, at startup)
+var cosmosSettings = configuration.GetSection("CosmosDb").Get<CosmosDbSettings>()!;
+var secretClient = new SecretClient(new Uri(cosmosSettings.KeyVaultUri), new DefaultAzureCredential());
+var secret = secretClient.GetSecret(cosmosSettings.SecretName);
+var connectionString = secret.Value.Value;
+
+// 2. Register MongoClient as singleton — critical for Cosmos connection pooling
+var mongoClientSettings = MongoClientSettings.FromConnectionString(connectionString);
+mongoClientSettings.ServerSelectionTimeout = TimeSpan.FromSeconds(10);
+services.AddSingleton(new MongoClient(mongoClientSettings));
+
+// 3. MongoDbContext still singleton; now receives MongoClient from DI
+services.AddSingleton<MongoDbContext>();
+```
+
+**Reason — `SecretClient` + `DefaultAzureCredential`:**
+
+`SecretClient` is the Azure SDK client for Key Vault secrets. It is constructed with the vault URI (from `CosmosDbSettings.KeyVaultUri`) and `DefaultAzureCredential`. Locally, `DefaultAzureCredential` resolves to `AzureCliCredential` (the developer's `az login` session). In AKS (Week 7), it resolves to `WorkloadIdentityCredential` (the pod's managed identity). Zero code change between environments.
+
+**Reason — synchronous `.GetSecret()` at startup:**
+
+The Key Vault call is synchronous (`GetSecret`, not `GetSecretAsync`). DI registration in .NET runs synchronously on the startup thread. Blocking here is acceptable because:
+1. It happens once at process startup, not per-request.
+2. If Key Vault is unreachable, the service fails to start with a clear error (fail-fast), rather than failing silently on first request.
+
+**Reason — `ServerSelectionTimeout = 10s`:**
+
+The MongoDB driver's default server selection timeout is 30 seconds. For Cosmos MongoDB API, if the connection string is wrong or the network is unavailable, a 30-second hang before startup failure is confusing. 10 seconds provides a reasonable window for transient network issues while failing fast enough to be useful.
+
+**Reason — `MongoClientSettings.FromConnectionString(connectionString)`:**
+
+The Cosmos connection string (from Key Vault) contains embedded parameters: `?ssl=true&replicaSet=globaldb&retrywrites=false&maxIdleTimeMS=120000&appName=@cosmos-antkart-dev@`. `FromConnectionString` parses all these automatically. The driver honours them — no need to set them explicitly.
+
+---
+
+### Change 6: appsettings.json — MongoDbSettings updated, CosmosDb section added
+
+**File:** `AK.Products/AK.Products.API/appsettings.json`
+
+**What changed:**
+
+```json
+// BEFORE
+"MongoDbSettings": {
+  "ConnectionString": "mongodb://localhost:27017",
+  "DatabaseName": "AKProductsDb",
+  "ProductsCollection": "products"
+}
+
+// AFTER
+"MongoDbSettings": {
+  "DatabaseName": "antkart-products",
+  "ProductsCollection": "products"
+},
+"CosmosDb": {
+  "KeyVaultUri": "https://kv-antkart-dev.vault.azure.net/",
+  "SecretName": "cosmos-connection-string"
+}
+```
+
+**Reason — ConnectionString removed:**
+
+A local MongoDB URI like `mongodb://localhost:27017` is a placeholder that is always wrong in cloud environments. More critically, replacing it with a Cosmos connection string (which contains an account key) would be a security violation — connection strings containing keys must never appear in committed config files. Removing the field eliminates the slot that could hold a secret.
+
+**Reason — `KeyVaultUri` and `SecretName` in appsettings:**
+
+These are non-secret references — they describe *where* to find the secret, not the secret itself. In AKS, these same values will be injected via a Kubernetes ConfigMap (not a Secret), confirming that they are not sensitive. This is the clear demarcation: appsettings holds configuration coordinates; Key Vault holds secrets.
+
+---
+
+### Change 7: MongoDbSettingsTests.cs — updated for new defaults + new CosmosDbSettings tests
+
+**File:** `AK.Products/AK.Products.Tests/Infrastructure/MongoDbSettingsTests.cs`
+
+**What changed:**
+
+- `DefaultConnectionString_ShouldBeLocalhost` — removed (property no longer exists)
+- `DefaultDatabaseName_ShouldBeACProductsDb` → renamed `DefaultDatabaseName_ShouldBeAntkartProducts`, assertion updated to `"antkart-products"`
+- `Properties_CanBeSetAndRead` — updated: removed `ConnectionString` line
+- Added 3 new tests for `CosmosDbSettings`: `DefaultSecretName_ShouldBeCosmosConnectionString`, `CosmosDbSettings_KeyVaultUri_DefaultsToEmpty`, `CosmosDbSettings_CanBeSetAndRead`
+
+**Reason:** Tests document the contract of the settings class. After removing `ConnectionString` and updating `DatabaseName`, the tests must reflect the new contract. Adding tests for `CosmosDbSettings` extends the same coverage discipline to the new class.
+
+**Test count change:** 618 → 620 (+2 net: 3 added, 1 removed from MongoDbSettingsTests; Products total: 202 → 204).
+
+---
+
+### Change 8 (Terraform): New identity module
+
+**Files added:**
+- `infrastructure/modules/identity/main.tf`
+- `infrastructure/modules/identity/variables.tf`
+- `infrastructure/modules/identity/outputs.tf`
+- `infrastructure/modules/identity/README.md`
+- `infrastructure/environments/dev/identity/terragrunt.hcl`
+
+**What the module creates:**
+
+1. `azurerm_user_assigned_identity.products` — User-Assigned Managed Identity `mi-ak-products-dev`
+2. `azurerm_role_assignment.products_kv_secrets_user` — Key Vault Secrets User on `kv-antkart-dev`
+3. `azurerm_role_assignment.products_sb_data_owner` — Azure Service Bus Data Owner on `sb-antkart-dev`
+
+**Reason — User-Assigned Managed Identity (not System-Assigned):**
+
+AKS Workload Identity requires a stable `client_id` that exists before the pod starts. User-assigned identities are independent resources with a fixed client ID. System-assigned identities are tied to the host resource lifecycle (VM, AKS node pool) and do not support Kubernetes OIDC federation.
+
+**Reason — Key Vault Secrets User (not Secrets Officer):**
+
+AK.Products only needs to *read* secrets (the Cosmos connection string). It has no need to create or delete secrets. `Secrets User` (read-only) follows the least-privilege principle. The Terraform Service Principal holds `Secrets Officer` (manage) for write operations during deployment.
+
+**Reason — Service Bus Data Owner:**
+
+MassTransit's `cfg.ConfigureEndpoints(ctx)` creates topics and subscriptions at startup (auto-topology). This requires the `Manage` permission on the namespace. `Azure Service Bus Data Owner` bundles Manage + Send + Listen — necessary for both auto-topology and message operations.
+
+**Reason — why Week 5 (not Week 7 when AKS is deployed):**
+
+Creating the managed identity now lets us verify that RBAC grants are correct before AKS exists. In Week 7, we only add the federated credential (the OIDC link between the AKS service account and this identity). The harder part — getting the identity and role assignments right — is done here.
+
+**Week 7 federation step (not yet done):**
+
+```hcl
+resource "azurerm_federated_identity_credential" "products" {
+  name                = "ak-products-federation"
+  resource_group_name = var.resource_group_name
+  parent_id           = azurerm_user_assigned_identity.products.id
+  audience            = ["api://AzureADTokenExchange"]
+  issuer              = <aks_oidc_issuer_url>
+  subject             = "system:serviceaccount:ak-products:ak-products-sa"
+}
+```
+
+The `products_identity_id` and `products_client_id` outputs of this module are the exact values needed for this step.
+
+---
+
+### What did NOT change in Week 5
+
+| Component | Reason unchanged |
+|-----------|-----------------|
+| `ProductRepository.cs` | MongoDB Driver API is identical for Cosmos MongoDB API |
+| `ProductClassMap.cs` | BSON mapping is driver-level, not transport-level |
+| `ProductSeeder.cs` | Uses `MongoDbContext.GetCollection()` — unaffected by connection source |
+| `UnitOfWork.cs` | Uses `IProductRepository` interface — zero infrastructure dependency |
+| All other services (Order, Payments, Notification, ShoppingCart, UserIdentity) | No Cosmos dependency; their messaging (Service Bus) is unchanged |
+| Integration tests (35 tests) | Use MassTransit in-memory harness — no real Cosmos connection |
+| All 617 other tests | Either mock `IMongoDatabase` directly or have no Products dependency |
+
+---
+
 ## Future Weeks (planned)
 
 | Week | Change |
 |------|--------|
-| 5 | AKS cluster provisioning (Terraform), ingress controller, namespace setup |
-| 6 | Dockerfiles review, image push to ACR, Helm chart scaffolding |
-| 7 | Deploy services to AKS, Workload Identity for Service Bus + Key Vault, kubectl port-forward for debugging |
-| 8 | Observability: Application Insights SDK integration, distributed tracing |
-| 9 | Auto-scaling, resource limits, production hardening |
+| 6 | Entra ID migration: move remaining services to use Workload Identity for all cloud resource access |
+| 7 | AKS cluster provisioning, ingress controller, Workload Identity federation (linking Week 5 identities to AKS pods) |
+| 8 | Deploy services to AKS: Dockerfiles, Helm charts, image push to ACR |
+| 9 | Observability: Application Insights SDK integration, distributed tracing |
+| 10 | Auto-scaling, resource limits, production hardening |
 
 Each week's changes will be documented here with the same format: file, what changed, why it changed.
