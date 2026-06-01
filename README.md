@@ -465,3 +465,13 @@ dotnet test
 | AK.Payments.Tests | 70 |
 | AK.Notification.Tests | 37 |
 | **Total** | **621** |
+
+## Project Docs
+
+| Document | Purpose |
+|----------|---------|
+| [KNOWN-ISSUES.md](KNOWN-ISSUES.md) | Deliberately-deferred bugs and tech debt — tracked, owned, and scheduled for a future fix phase |
+| [EVENTBUS.md](EVENTBUS.md) | Event bus and SAGA design |
+| [RESILIENCE.md](RESILIENCE.md) | Polly circuit breaker design |
+| [OBSERVABILITY.md](OBSERVABILITY.md) | ELK observability design |
+| [docs/adr/README.md](docs/adr/README.md) | Architecture Decision Records index (ADR-F1, ADR-F2, ADR-001 through ADR-014) |
