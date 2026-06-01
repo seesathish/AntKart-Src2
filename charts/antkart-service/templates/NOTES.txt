@@ -1,0 +1,22 @@
+{{- /*
+  Helm renders this file after `helm install` succeeds. It's the post-install
+  cheat sheet the user sees in their terminal.
+*/ -}}
+
+Service deployed: {{ include "antkart-service.fullname" . }}
+Namespace:        {{ .Release.Namespace }}
+Image:            {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
+Workload Identity: {{ if .Values.workloadIdentity.enabled }}ENABLED (client-id {{ .Values.workloadIdentity.clientId }}){{ else }}DISABLED — DefaultAzureCredential calls will fail until federation is configured{{ end }}
+
+Quick checks:
+  kubectl get pods -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }}
+  kubectl logs   -n {{ .Release.Namespace }} -l app.kubernetes.io/instance={{ .Release.Name }} --tail=100
+
+Port-forward for local testing:
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "antkart-service.fullname" . }} 8080:{{ .Values.service.port }}
+  Then hit:  http://localhost:8080/health
+
+Verify Workload Identity is working (only if enabled):
+  kubectl exec -n {{ .Release.Namespace }} -it <pod> -- env | grep AZURE_
+  # Expect: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_FEDERATED_TOKEN_FILE
+  # (Chiseled images have no shell — use `kubectl debug` ephemeral container instead.)

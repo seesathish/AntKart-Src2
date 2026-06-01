@@ -1,0 +1,50 @@
+# =============================================================================
+# AK.Payments — Helm values
+# Status: NOT YET DEPLOYED — see order.yaml header for the federation prerequisite.
+# =============================================================================
+
+nameOverride: ak-payments
+
+image:
+  repository: acrantkartdev.azurecr.io/ak-payments
+
+containerPort: 8080
+service:
+  port: 80
+  targetPort: 8080
+
+workloadIdentity:
+  enabled: false           # PLACEHOLDER — flip after mi-ak-payments-dev federation
+  clientId: ""
+
+serviceAccount:
+  create: true
+  name: ak-payments-sa
+
+env:
+  - name: ASPNETCORE_ENVIRONMENT
+    value: Production
+
+  - name: ConnectionStrings__Postgres
+    value: "PLACEHOLDER-set-via-key-vault-or-aad-auth-when-deployed"
+
+  - name: ServiceBus__FullyQualifiedNamespace
+    value: sb-antkart-dev.servicebus.windows.net
+
+  # Razorpay test keys — set via Key Vault when deployed (see ADR-010 for the
+  # Key Vault pattern). Inline for now is fine because they're sandbox keys.
+  - name: Razorpay__KeyId
+    value: "PLACEHOLDER-set-via-key-vault-when-deployed"
+  - name: Razorpay__KeySecret
+    value: "PLACEHOLDER-set-via-key-vault-when-deployed"
+
+  - name: AzureAd__TenantId
+    value: 4cacc56a-0d38-46c4-ba20-429d51d7b449
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

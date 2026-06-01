@@ -2491,6 +2491,310 @@ func start
 
 ---
 
+## Section 7: Deploying AntKart to AKS — Cluster, Workload Identity, Helm
+
+Phase 2C moves the AntKart services from Docker Compose into Kubernetes. This section walks through provisioning the cluster, building the custom base image, federating Workload Identity, deploying AK.Products via Helm, and verifying that the pod authenticates to Cosmos DB with **zero secrets**.
+
+This section is denser than the others because it teaches three Kubernetes concepts and one identity concept simultaneously. Read 7.1 through 7.4 before running any commands.
+
+---
+
+### 7.1 — Why Kubernetes? Why AKS?
+
+Docker Compose runs all services on one host. That works for development. Production needs:
+- Independent service scaling (cart and product services scale separately under traffic)
+- Self-healing (a crashed pod restarts automatically)
+- Rolling deploys (new image rolls out one pod at a time)
+- Declarative desired state (versioned manifests, not imperative `docker run`)
+
+Kubernetes provides all four. **AKS** is Azure's managed Kubernetes — Azure runs the control plane (the API server, scheduler, etcd, controller manager) and you pay only for the worker node VMs. The control plane in AKS Free tier is, well, free.
+
+What you trade for "managed": you cannot SSH into the API server or hand-tune etcd. For any normal workload that's a benefit, not a limitation.
+
+---
+
+### 7.2 — Cluster shape: two node pools, Azure CNI, Workload Identity
+
+`infrastructure/modules/aks/main.tf` creates one cluster with:
+
+| Pool | VM | Min/Max | Purpose | Taint |
+|------|----|---------|---------|-------|
+| `system` | `Standard_B2s` | 1 / 2 | CoreDNS, metrics-server, Azure CNI, Container Insights agent | `CriticalAddonsOnly=true:NoSchedule` |
+| `user`   | `Standard_B2s` | 1 / 3 | AntKart application pods | (none) |
+
+The system pool taint is the cleanest way to keep app pods off the system pool: any pod without a matching toleration (which is every pod in `charts/antkart-service`) is excluded automatically. No nodeSelector tricks needed.
+
+**Azure CNI** gives every pod a real VNet IP from the `snet-aks-antkart-dev` subnet (10.0.0.0/22, ~1019 usable IPs). With Azure CNI:
+- Pods can be addressed directly from private endpoints — Cosmos DB and Service Bus connections stay on the Azure backbone.
+- NSG rules apply to pod traffic (visible in Azure Monitor).
+- Trade-off: subnet IPs are consumed per pod, not per node. /22 caps at ~33 nodes worth of pods, plenty for dev.
+
+**OIDC issuer + Workload Identity** are two cluster feature flags that together enable the secret-less authentication described in §7.4. They are free to enable.
+
+---
+
+### 7.3 — The custom hardened base image
+
+All 8 services FROM `acrantkartdev.azurecr.io/antkart-base:9.0`, a chiseled .NET 9 ASP.NET runtime hosted in our own ACR. See [`docker/base/Dockerfile`](docker/base/Dockerfile) for the full annotated source and the rationale comments.
+
+Four reasons for an organisation-owned base instead of pulling Microsoft's image directly:
+
+1. **Supply-chain control** — if Microsoft retags `aspnet:9.0`, our service builds are unaffected because we pin to our ACR copy.
+2. **Faster AKS pulls** — kubelet pulls from ACR over the Azure backbone, no internet egress.
+3. **Single hardening surface** — invariant globalization, OCI labels, non-root enforcement applied once.
+4. **Week 11 target** — Trivy scanning + admission policy that gates on the signed base-image digest can only work if every service uses the same base.
+
+**Chiseled** means no shell, no apt, no coreutils. Tiny attack surface. Image is ~115 MB vs ~220 MB for the standard runtime.
+
+**Debugging trade-off:** `kubectl exec -it <pod> -- /bin/sh` will not work — there is no shell in the running container. The modern Kubernetes pattern is ephemeral debug containers (§7.7).
+
+---
+
+### 7.4 — Workload Identity: the secret-less auth chain
+
+The single largest change in Phase 2C is that pods in AKS authenticate to Azure resources **without any secret, anywhere**. The same `DefaultAzureCredential` line of C# that runs locally with `az login` runs in AKS and picks up a projected service-account token.
+
+The full chain:
+
+```
+┌─────────────┐     ┌──────────────────┐     ┌──────────────────┐     ┌────────────────────┐     ┌──────────────────┐
+│ AKS Pod     │ ──▶ │ K8s              │ ──▶ │ Federated        │ ──▶ │ Entra Managed      │ ──▶ │ Azure Resource   │
+│ ak-products │     │ ServiceAccount   │     │ Credential       │     │ Identity           │     │ (KV, SB, …)      │
+│             │     │ ak-products-sa   │     │ (this Week 7)    │     │ mi-ak-products-dev │     │                  │
+└─────────────┘     └──────────────────┘     └──────────────────┘     └────────────────────┘     └──────────────────┘
+       │                    │                          │                          │
+       │ azure.workload.    │ azure.workload.          │ subject =                │ pre-existing roles:
+       │  identity/use:     │  identity/client-id:     │  system:serviceaccount:  │   Key Vault Secrets User
+       │  "true"            │  <products_client_id>    │  ak-products:            │   Service Bus Data Owner
+       │ (pod label)        │ (SA annotation)          │  ak-products-sa          │ (granted Week 5)
+       │                    │                          │ issuer =                 │
+       │                    │                          │  <AKS OIDC issuer URL>   │
+```
+
+The chain runs at pod startup:
+
+1. **AKS Workload Identity webhook** sees the pod label and SA annotation. It injects three env vars into the pod (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE`) and mounts a short-lived projected JWT at the path that last env var points to.
+2. **`DefaultAzureCredential`** in the .NET app, scanning its provider chain, finds `AZURE_FEDERATED_TOKEN_FILE` and uses `WorkloadIdentityCredential`. It reads the JWT and presents it to Entra ID.
+3. **Entra ID** validates the JWT against the AKS cluster's OIDC issuer (JWKS public keys are fetched from the issuer URL). It looks up federated credentials by `(issuer, subject)`, finds the `fc-mi-ak-products-dev` record we created, and confirms the token came from a trusted Kubernetes service account.
+4. **Entra ID issues an Azure access token** for `mi-ak-products-dev`. The pod now has the same access that would have been granted by `az login` as that managed identity.
+5. **The application calls Azure** (Key Vault for the Cosmos connection string, Service Bus for messaging). Each resource sees a normal Entra access token from `mi-ak-products-dev`'s `principal_id` and applies the roles granted in Week 5 (Key Vault Secrets User + Service Bus Data Owner).
+
+**Zero secrets in code, in env vars, in Kubernetes Secrets, in image layers, in etcd backups.**
+
+The federated credential is created by extending the identity Terraform module (`infrastructure/modules/identity/main.tf`):
+- A new variable `aks_oidc_issuer_url` (optional — null skips federation)
+- A new resource `azurerm_federated_identity_credential.products` (`count = 1` when URL is set)
+- The dev wiring (`environments/dev/identity/terragrunt.hcl`) now depends on the `aks` module
+
+The two-pass apply pattern: identity module was first applied in Week 5 (URL=null, federation skipped). After AKS is applied in Week 7, re-applying identity creates the federation as a delta. No data loss.
+
+---
+
+### 7.5 — Helm chart: one template, 8 services
+
+`charts/antkart-service/` is one reusable chart serving all 8 microservices. Per-service overrides live in `charts/values/<service>.yaml`. See `charts/antkart-service/README.md` for a full breakdown.
+
+| Service | Status in Week 7 | Workload Identity |
+|---------|-------------------|-------------------|
+| AK.Products | **Deployed** | ENABLED — `mi-ak-products-dev` federated |
+| All other 7 | Values files exist; not deployed | DISABLED (placeholder) |
+
+The 7 non-deployed values files explicitly set `workloadIdentity.enabled: false` and leave `clientId: ""`. They are safe to `helm template` (catches template errors) but should not be `helm install`-ed until each service's managed identity is created and federated. The chart's `serviceaccount.yaml` skips the WI annotation when disabled — pods would start but `DefaultAzureCredential` calls fail at runtime. That's a deliberate safe-failure mode.
+
+---
+
+### 7.6 — Deploy walkthrough (run these in order)
+
+> Cost note: AKS provisioning takes 10–15 minutes and starts charging from `terragrunt apply`. Tear down with §7.10 when finished.
+
+#### Phase 2a — provision AKS
+
+```powershell
+cd infrastructure/environments/dev/aks
+terragrunt init
+terragrunt plan                                      # REVIEW node sizing
+terragrunt apply                                     # ~10-15 min
+```
+
+#### Phase 2b — federate the Products managed identity
+
+The identity module skipped federation in Week 5 (no AKS existed). Re-apply now that AKS is up:
+
+```powershell
+cd ../identity
+terragrunt apply                                     # adds fc-mi-ak-products-dev federation
+```
+
+#### Phase 2c — get kubectl credentials and confirm
+
+```powershell
+az aks get-credentials `
+    --resource-group rg-antkart-dev-eastus `
+    --name aks-antkart-dev `
+    --overwrite-existing
+
+kubectl get nodes                                    # expect 2 nodes (1 system, 1 user)
+kubectl describe node | Select-String "Taints"      # confirm CriticalAddonsOnly on system pool
+```
+
+#### Phase 2d — build and push the custom base image
+
+```powershell
+cd "C:\Users\seesa\OneDrive\Desktop\AntCart\AntKart"
+
+az acr login --name acrantkartdev
+
+# Build + push antkart-base in one ACR Tasks command (no local Docker daemon needed).
+az acr build `
+    --registry acrantkartdev `
+    --image "antkart-base:9.0" `
+    --image "antkart-base:9.0-$(Get-Date -Format yyyyMMdd)" `
+    --file docker/base/Dockerfile `
+    docker/base
+```
+
+#### Phase 2e — build and push the Products service image
+
+```powershell
+$SHA = git rev-parse --short HEAD
+
+az acr build `
+    --registry acrantkartdev `
+    --image "ak-products:$SHA" `
+    --image "ak-products:latest" `
+    --file AK.Products/AK.Products.API/Dockerfile `
+    .
+```
+
+#### Phase 2f — fetch the Workload Identity client ID
+
+```powershell
+cd infrastructure/environments/dev/identity
+$PRODUCTS_CLIENT_ID = terragrunt output -raw products_client_id
+cd ../../../..
+```
+
+#### Phase 2g — `helm install` AK.Products
+
+```powershell
+$AZURE_AD_CLIENT_ID   = "<paste from Entra app registration overview>"
+$AZURE_AD_AUDIENCE    = "api://$AZURE_AD_CLIENT_ID"
+$SHA                  = git rev-parse --short HEAD
+
+helm install ak-products charts/antkart-service `
+    --namespace ak-products --create-namespace `
+    -f charts/values/products.yaml `
+    --set image.tag=$SHA `
+    --set workloadIdentity.clientId=$PRODUCTS_CLIENT_ID `
+    --set "env[5].value=$AZURE_AD_CLIENT_ID" `
+    --set "env[6].value=$AZURE_AD_AUDIENCE"
+```
+
+(The `--set "env[N].value=..."` indices line up with the env list order in `charts/values/products.yaml`. A cleaner pattern for later weeks is to put the Entra values into the values file directly or into a per-environment values overlay.)
+
+---
+
+### 7.7 — Verify Workload Identity works (the no-secret check)
+
+Three checks, increasing in confidence:
+
+**Check 1 — projected token env vars are present**
+
+Chiseled containers have no shell, so `kubectl exec` won't work. Use `kubectl debug` to attach an ephemeral container that shares the pod's PID namespace:
+
+```powershell
+$POD = kubectl get pod -n ak-products -l app.kubernetes.io/instance=ak-products -o name
+
+kubectl debug -n ak-products $POD -it `
+    --image=mcr.microsoft.com/dotnet/runtime-deps:9.0 `
+    --target=antkart-service `
+    -- /bin/sh
+
+# Inside the debug container:
+ls /proc/1/root/var/run/secrets/azure/tokens/
+cat /proc/1/environ | tr '\0' '\n' | grep AZURE_
+exit
+```
+
+Expect to see `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE`, and an `azure-identity-token` file under `/var/run/secrets/azure/tokens/`.
+
+**Check 2 — the pod actually fetched the Cosmos connection string from Key Vault**
+
+```powershell
+kubectl logs -n ak-products -l app.kubernetes.io/instance=ak-products --tail=200
+```
+
+Look for the Serilog line confirming the Key Vault secret fetch succeeded (`Successfully retrieved secret 'cosmos-connection-string' from Key Vault`) and the MongoDB client connecting to Cosmos DB. No errors about missing credentials.
+
+**Check 3 — the API actually works end-to-end**
+
+```powershell
+kubectl port-forward -n ak-products svc/ak-products 8080:80
+
+# In another terminal:
+curl http://localhost:8080/health
+curl http://localhost:8080/api/v1/products/categories
+# Expect: ["Men","Women","Kids"]
+curl "http://localhost:8080/api/v1/products?pageSize=1"
+# Expect: totalCount=300
+```
+
+If categories returns 3 names and totalCount is 300, the pod authenticated to Key Vault, fetched the Cosmos connection string, connected to Cosmos, ran the idempotent seeder (a no-op because count≥300 from Week 5), and served the request. The full chain works.
+
+---
+
+### 7.8 — Adding a new service's Workload Identity (Weeks 8+)
+
+The pattern is four steps, all parameterised:
+
+1. **Create UAMI in identity module** — copy the `products` block in `infrastructure/modules/identity/main.tf`, rename to the new service (e.g. `order`). Same for role assignments (Service Bus Data Owner for messaging; Postgres equivalent if using AAD auth).
+2. **Add the federated credential** — copy the `azurerm_federated_identity_credential.products` block, rename, parameterise the namespace + service account name.
+3. **`terragrunt apply` the identity module** — picks up the new resources.
+4. **In the per-service values file** — flip `workloadIdentity.enabled: true`, set `workloadIdentity.clientId` via `--set` at install time from `terragrunt output -raw <service>_client_id`.
+
+The chart template doesn't change. The Helm install command doesn't change. The application code doesn't change.
+
+---
+
+### 7.9 — Common issues
+
+| Symptom | Likely cause |
+|---------|--------------|
+| `ImagePullBackOff` with `401 Unauthorized` | `AcrPull` role missing on the kubelet identity. Check `terragrunt state list` in the AKS module — should include `azurerm_role_assignment.kubelet_acr_pull`. |
+| Pod starts, then dies with `AADSTS70021: No matching federated identity record found` | Federation `subject` doesn't match. The federated credential subject (in Terraform) MUST equal `system:serviceaccount:<namespace>:<sa-name>` where namespace = the Helm install namespace, and sa-name = `serviceAccount.name` in the values file. |
+| Pod starts but app errors with `DefaultAzureCredential failed to retrieve a token` | Either WI is disabled in the values file, or the `azure.workload.identity/use=true` pod label isn't there. Run `kubectl get pod -o yaml | grep workload.identity` to confirm. |
+| `kubectl exec -- /bin/sh` returns "executable file not found" | Chiseled image has no shell. Use `kubectl debug` instead — §7.7. |
+| Pod stuck `Pending` with "0/2 nodes available" | User node pool at capacity. Either scale up `max_count` in the AKS module or reduce pod resource requests. |
+
+---
+
+### 7.10 — Destroy AKS when idle (cost control)
+
+AKS is the single largest cost driver in AntKart's dev environment (~$90/month if left running). Destroy when not actively testing:
+
+```powershell
+cd infrastructure/environments/dev/aks
+terragrunt destroy
+```
+
+This tears down:
+- The cluster (control plane + system pool + user pool)
+- The auto-created node resource group (`MC_rg-antkart-dev-eastus_aks-antkart-dev_eastus`)
+- The AcrPull role assignment
+
+It does **not** destroy:
+- The ACR (images persist)
+- The Cosmos DB account or its data
+- The Service Bus namespace, topics, or subscriptions
+- The managed identities or their role assignments
+- The federated credential (it becomes a dangling reference to a non-existent OIDC issuer — Terraform shows drift on next apply but that's harmless)
+
+Recreating the cluster later takes 10–15 minutes (`terragrunt apply` in the aks folder, then re-apply identity to refresh the federation).
+
+**Cost when AKS is destroyed:** the remaining infra (RG, networking, ACR Basic, Cosmos serverless, Service Bus Standard, Key Vault, Log Analytics) is ~$15–20/month.
+
+---
+
 ## Appendix A — Deploying all dev modules at once
 
 Once you're comfortable with the individual steps, Terragrunt's `run-all` command lets you deploy everything in one command from the environment root:

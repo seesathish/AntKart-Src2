@@ -1,0 +1,42 @@
+# =============================================================================
+# antkart-service — Reusable Helm chart for all 8 AntKart microservices
+#
+# ONE CHART, EIGHT SERVICES:
+#   This single chart is parameterized so it can deploy any AntKart service
+#   (Products, Order, Payments, Notification, ShoppingCart, UserIdentity,
+#   Gateway, Discount) by passing a different per-service values file from
+#   charts/values/<service>.yaml.
+#
+# WHY ONE CHART INSTEAD OF EIGHT:
+#   - Single source of truth for Deployment/Service/ServiceAccount/HPA templates
+#   - Add a feature (e.g., new probe config) once, all 8 services pick it up
+#   - Forces architectural consistency: if a service needs something the chart
+#     can't express, that's a hint the service is doing something non-standard
+#     that should be made standard (or it gets its own chart).
+#
+# INSTALL EXAMPLE:
+#   helm install ak-products charts/antkart-service \
+#       --namespace ak-products --create-namespace \
+#       -f charts/values/products.yaml \
+#       --set image.tag=$(git rev-parse --short HEAD)
+# =============================================================================
+apiVersion: v2
+name: antkart-service
+description: Reusable Helm chart for AntKart microservices on AKS
+type: application
+
+# Chart version — bumped when the chart templates themselves change.
+# This is the chart's release version, NOT the version of any service image.
+version: 0.1.0
+
+# appVersion — the .NET runtime / platform version this chart is designed for.
+# Just informational; the actual image tag is set per-install via values.
+appVersion: "9.0"
+
+# Helm chart kubeVersion constraint. AKS Kubernetes versions in production
+# range 1.28–1.31 currently; ~> 1.28 keeps us compatible with any current AKS.
+kubeVersion: ">=1.28.0-0"
+
+maintainers:
+  - name: AntKart
+    url: https://github.com/seesathish/AntKart-Src2

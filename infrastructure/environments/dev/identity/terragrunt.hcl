@@ -97,6 +97,35 @@ dependency "servicebus" {
   mock_outputs_allowed_terraform_commands = ["validate", "plan"]
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DEPENDENCY: AKS — Workload Identity federation (added Week 7)
+#
+# The identity module creates a federated_identity_credential linking the
+# AKS OIDC issuer to mi-ak-products-dev. Without the AKS module having been
+# applied first, the issuer URL is unknown — the federation resource gates
+# itself on `aks_oidc_issuer_url != null` so it skips creation cleanly.
+#
+# The skip_outputs / mock_outputs pattern lets you still `terragrunt plan`
+# and `terragrunt apply` this module BEFORE AKS exists (matches the Week 5
+# state). After AKS is applied, re-running terragrunt apply here picks up the
+# real URL via outputs and creates the federation credential as a delta.
+# ─────────────────────────────────────────────────────────────────────────────
+dependency "aks" {
+  config_path = "../aks"
+
+  # Allow this dependency to be missing — the identity module skips federation
+  # if the issuer URL is null. This is what lets the Week 5 ordering still work.
+  skip_outputs = false
+
+  mock_outputs = {
+    name                       = "mock-aks-antkart-dev"
+    oidc_issuer_url            = null
+    node_resource_group        = "MC_mock-rg_mock-aks-antkart-dev_eastus"
+    kubelet_identity_object_id = "00000000-0000-0000-0000-000000000000"
+  }
+  mock_outputs_allowed_terraform_commands = ["validate", "plan"]
+}
+
 inputs = {
   # mi-ak-products-dev — naming: mi = managed identity, ak = AntKart prefix
   products_identity_name   = "mi-ak-products-${include.env.locals.environment}"
@@ -105,4 +134,12 @@ inputs = {
   key_vault_id             = dependency.key_vault.outputs.id
   service_bus_namespace_id = dependency.servicebus.outputs.namespace_id
   tags                     = include.env.locals.common_tags
+
+  # Workload Identity federation. Until the AKS module is applied,
+  # oidc_issuer_url will be null and the federation resource is skipped.
+  # K8s namespace + ServiceAccount names match charts/values/products.yaml —
+  # change here AND in the chart values together, or federation breaks silently.
+  aks_oidc_issuer_url          = dependency.aks.outputs.oidc_issuer_url
+  products_k8s_namespace       = "ak-products"
+  products_k8s_service_account = "ak-products-sa"
 }

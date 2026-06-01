@@ -1,0 +1,36 @@
+{{/*
+=============================================================================
+  HorizontalPodAutoscaler — only rendered when autoscaling.enabled = true.
+
+  Disabled by default in Week 7 because:
+    - We're deploying a single service (Products) for the Workload Identity
+      verification milestone, not load-testing.
+    - replicaCount: 1 keeps the B2s user node pool happy (one pod takes
+      ~150 MiB request out of B2s's ~3.5 GiB allocatable).
+
+  Enable per-service in Week 8+ when there's actual traffic to scale on.
+=============================================================================
+*/}}
+{{- if .Values.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "antkart-service.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "antkart-service.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "antkart-service.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}

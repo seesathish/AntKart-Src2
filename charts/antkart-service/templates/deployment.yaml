@@ -1,0 +1,122 @@
+{{/*
+=============================================================================
+  Deployment template — runs the service pods.
+
+  KEY POINTS:
+    - The pod template carries `azure.workload.identity/use: "true"` ONLY when
+      workloadIdentity.enabled. This is the label AKS's mutating webhook
+      watches for; without it, no token projection happens.
+    - readOnlyRootFilesystem=true means .NET can't write to /. We mount a
+      writable emptyDir at /tmp so System.IO.Path.GetTempPath() and ASP.NET
+      Core's compiled-Razor cache work.
+    - We do NOT set nodeSelector for the user pool. The system pool is
+      tainted CriticalAddonsOnly=true:NoSchedule; without a matching
+      toleration here, the scheduler can only place this pod on the user
+      pool. Cleaner than nodeSelector for the same effect.
+=============================================================================
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "antkart-service.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "antkart-service.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "antkart-service.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "antkart-service.selectorLabels" . | nindent 8 }}
+        {{- if .Values.workloadIdentity.enabled }}
+        # This label is what AKS's Workload Identity webhook scans for.
+        # Without it, AZURE_FEDERATED_TOKEN_FILE is never set in the pod
+        # and DefaultAzureCredential cannot reach WorkloadIdentityCredential.
+        azure.workload.identity/use: "true"
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "antkart-service.serviceAccountName" . }}
+
+      # Pod-level security context: enforce non-root + matching fsGroup so
+      # mounted volumes are owned by UID 1654 (the antkart-base user).
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+
+      containers:
+        - name: {{ .Chart.Name }}
+
+          # Image: ACR-qualified repository + tag. Tag defaults to Chart.appVersion
+          # if the install didn't pass one. Use --set image.tag=<sha> in CI.
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPort }}
+              protocol: TCP
+
+          # Container-level security context: drop all caps, no privilege
+          # escalation, read-only root FS. /tmp is mounted writable below.
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+
+          {{- if .Values.env }}
+          env:
+            {{- toYaml .Values.env | nindent 12 }}
+          {{- end }}
+
+          # /tmp must be writable for ASP.NET Core (compiled-view cache, .NET
+          # temp files). Using emptyDir (in-memory, pod-lifecycle) instead of
+          # a PVC because nothing in /tmp needs to survive pod restarts.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+          # Readiness: gates Service endpoint inclusion. Failures during
+          # startup or transient dependency issues drain traffic without
+          # killing the pod.
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+
+          # Liveness: kubelet restarts the pod on failure. Generous
+          # initialDelay accommodates .NET cold start + Cosmos key-vault
+          # fetch + MassTransit topology setup.
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: http
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

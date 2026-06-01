@@ -1,0 +1,51 @@
+# =============================================================================
+# AK.Gateway — Helm values
+# Status: NOT YET DEPLOYED — exposed externally in a later week.
+#
+# Gateway is the ONLY service that:
+#   - Listens on port 8000 (not 8080) — see AK.Gateway/AK.Gateway.API/Dockerfile
+#   - Will eventually use service.type=LoadBalancer (public IP) instead of ClusterIP
+#
+# It doesn't need Workload Identity — Ocelot is a pass-through router, not an
+# Azure-resource consumer.
+# =============================================================================
+
+nameOverride: ak-gateway
+
+image:
+  repository: acrantkartdev.azurecr.io/ak-gateway
+
+# Override the chart's default 8080 → 8000 for Gateway.
+containerPort: 8000
+
+service:
+  type: ClusterIP        # Will become LoadBalancer when externally exposed
+  port: 80               # Service-side port — still 80
+  targetPort: 8000       # Pod-side port matches containerPort
+
+workloadIdentity:
+  enabled: false         # Gateway doesn't call Azure resources directly
+  clientId: ""
+
+serviceAccount:
+  create: true
+  name: ak-gateway-sa
+
+env:
+  - name: ASPNETCORE_ENVIRONMENT
+    value: Production
+
+  - name: AzureAd__TenantId
+    value: 4cacc56a-0d38-46c4-ba20-429d51d7b449
+
+# Override probes — Gateway's /health is registered the same way but listens
+# on the gateway port (8000), not 8080. The chart's named-port mapping handles
+# this automatically because containerPort is set above.
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

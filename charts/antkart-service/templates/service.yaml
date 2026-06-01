@@ -1,0 +1,32 @@
+{{/*
+=============================================================================
+  Service template — ClusterIP exposing the pod inside the cluster.
+
+  Other services (and the Gateway when we deploy it) reach this service via:
+      http://<name>.<namespace>.svc.cluster.local:<port>
+  e.g. http://ak-products.ak-products.svc.cluster.local:80
+
+  For local-laptop access during Week 7 development:
+      kubectl port-forward -n ak-products svc/ak-products 8080:80
+      curl http://localhost:8080/api/v1/products/categories
+=============================================================================
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "antkart-service.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "antkart-service.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      # targetPort uses the NAMED port from deployment.yaml ("http"). Naming
+      # the port lets us change the container port number later without
+      # touching the Service definition — just update containerPort in values.
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "antkart-service.selectorLabels" . | nindent 4 }}

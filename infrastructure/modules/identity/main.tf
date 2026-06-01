@@ -140,3 +140,89 @@ resource "azurerm_role_assignment" "products_sb_data_owner" {
   role_definition_name = "Azure Service Bus Data Owner"
   principal_id         = azurerm_user_assigned_identity.products.principal_id
 }
+
+# =============================================================================
+# WORKLOAD IDENTITY FEDERATION — AK.Products (added Week 7)
+#
+# THE FULL CHAIN, EXPLAINED:
+#
+#   AKS pod  ─ k8s ServiceAccount ─ federated credential ─ Entra managed identity ─ Azure resource
+#   ──────   ────────────────────   ──────────────────────   ────────────────────────   ──────────────
+#   ak-products  ak-products-sa     this resource (below)    mi-ak-products-dev         Key Vault, SB
+#
+#   STEP 1: Pod template carries the label
+#       azure.workload.identity/use: "true"
+#       (set by the Helm chart in charts/antkart-service/templates/deployment.yaml)
+#
+#   STEP 2: Pod's ServiceAccount carries the annotation
+#       azure.workload.identity/client-id: <products_client_id>
+#       (set by the Helm chart's serviceaccount.yaml when workloadIdentity.enabled=true)
+#
+#   STEP 3: At pod start, AKS mounts a short-lived JWT into the pod at
+#       /var/run/secrets/azure/tokens/azure-identity-token
+#       and sets the env vars:
+#           AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_FEDERATED_TOKEN_FILE.
+#
+#   STEP 4: When DefaultAzureCredential runs in the app (e.g., SecretClient for
+#       Key Vault, ServiceBusClient via MassTransit), the WorkloadIdentityCredential
+#       provider reads the token file and calls the Entra ID token endpoint:
+#           "Here's a JWT issued by AKS for k8s SA ak-products-sa in namespace
+#            ak-products. Please exchange it for an Azure access token."
+#
+#   STEP 5: Entra ID looks up federated credentials by (issuer, subject) pair.
+#       The federated credential below says:
+#           issuer  = "<AKS OIDC URL>"
+#           subject = "system:serviceaccount:ak-products:ak-products-sa"
+#       Matches → Entra ID issues an access token for mi-ak-products-dev's
+#       principal, scoped to whichever Azure resource the app is calling.
+#
+#   STEP 6: The Azure resource (Key Vault, Service Bus) sees a normal Azure
+#       access token from mi-ak-products-dev's principal_id and applies the
+#       roles already granted by products_kv_secrets_user and
+#       products_sb_data_owner above.
+#
+# NET RESULT: zero secrets in code, in config, in Kubernetes Secrets, in env vars.
+# The SAME DefaultAzureCredential line that ran on the developer's laptop with
+# `az login` now runs in AKS, picks up the projected token automatically, and
+# authenticates as the managed identity. This is the entire point of Workload
+# Identity — application code is unchanged, the credential source differs only
+# by deployment environment.
+#
+# OPERATIONAL NOTE — TWO-PASS APPLY:
+#   The first time the identity module was applied (Week 5), AKS did not yet
+#   exist. var.aks_oidc_issuer_url was null and this resource was skipped via
+#   count = 0. After Week 7's AKS module is applied, re-apply this module with
+#   the URL piped through dependency.aks.outputs.oidc_issuer_url — Terraform
+#   creates the federated credential as a delta change.
+# =============================================================================
+resource "azurerm_federated_identity_credential" "products" {
+  count = var.aks_oidc_issuer_url != null ? 1 : 0
+
+  name = "fc-${var.products_identity_name}"
+
+  # NOTE on `resource_group_name` and `parent_id` deprecation warnings:
+  #   AzureRM 4.x's LSP marks both attributes as deprecated for a future
+  #   major-version schema change. They still work today and are the
+  #   documented required arguments in the registry docs for v4.x. The
+  #   migration path isn't published yet — when it is, this resource will be
+  #   updated alongside the rest of the module. Tracked informally; not
+  #   urgent because the warnings don't block apply.
+  resource_group_name = var.resource_group_name
+  parent_id           = azurerm_user_assigned_identity.products.id
+
+  # Audience MUST be exactly this literal string. Entra ID rejects any other
+  # value when validating the workload identity token exchange.
+  audience = ["api://AzureADTokenExchange"]
+
+  # The AKS cluster's OIDC issuer URL. Entra ID fetches the JWKS from this
+  # URL to validate that the incoming JWT was actually signed by THIS cluster.
+  issuer = var.aks_oidc_issuer_url
+
+  # The OIDC subject claim that this federated credential will trust.
+  # The format "system:serviceaccount:<namespace>:<name>" is what Kubernetes
+  # puts in the `sub` claim of the projected ServiceAccount token.
+  # Changing either side here OR the matching values in the Helm chart breaks
+  # the federation silently — kubectl logs will show
+  #     "AADSTS70021: No matching federated identity record found"
+  subject = "system:serviceaccount:${var.products_k8s_namespace}:${var.products_k8s_service_account}"
+}

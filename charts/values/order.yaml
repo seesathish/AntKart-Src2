@@ -1,0 +1,56 @@
+# =============================================================================
+# AK.Order — Helm values
+# Status: NOT YET DEPLOYED — managed identity for this service does not exist yet.
+#
+# DO NOT HELM INSTALL THIS UNTIL:
+#   1. mi-ak-order-dev created in the identity Terraform module
+#   2. Role grants applied (Service Bus Data Owner, Postgres equivalent)
+#   3. Federation added linking mi-ak-order-dev to system:serviceaccount:ak-order:ak-order-sa
+#   4. workloadIdentity.enabled flipped to true here AND clientId populated at install
+#
+# Until then, Workload Identity is DISABLED — pods would start but any
+# DefaultAzureCredential call (Service Bus, Postgres if AAD-auth) would fail.
+# Keeping this file lets us validate the chart template generalizes across
+# services without risking accidental broken deployments.
+# =============================================================================
+
+nameOverride: ak-order
+
+image:
+  repository: acrantkartdev.azurecr.io/ak-order
+
+containerPort: 8080
+service:
+  port: 80
+  targetPort: 8080
+
+workloadIdentity:
+  enabled: false           # PLACEHOLDER — flip to true after identity federation
+  clientId: ""             # PLACEHOLDER — set to mi-ak-order-dev client_id at that time
+
+serviceAccount:
+  create: true
+  name: ak-order-sa
+
+env:
+  - name: ASPNETCORE_ENVIRONMENT
+    value: Production
+
+  # PLACEHOLDER — once Workload Identity is enabled, swap to ConnectionStrings__Postgres
+  # sourced from Key Vault, or use AAD-auth for Postgres. For now this would fail.
+  - name: ConnectionStrings__Postgres
+    value: "PLACEHOLDER-set-via-key-vault-or-aad-auth-when-deployed"
+
+  - name: ServiceBus__FullyQualifiedNamespace
+    value: sb-antkart-dev.servicebus.windows.net
+
+  - name: AzureAd__TenantId
+    value: 4cacc56a-0d38-46c4-ba20-429d51d7b449
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

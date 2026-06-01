@@ -1,6 +1,8 @@
-FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS base
-WORKDIR /app
-EXPOSE 8080
+# =============================================================================
+# AK.Order.API — Dockerfile
+# Inherits from acrantkartdev.azurecr.io/antkart-base:9.0 — see docker/base/Dockerfile
+# for the chiseled / non-root / globalization-invariant rationale.
+# =============================================================================
 
 FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
 WORKDIR /src
@@ -13,13 +15,9 @@ COPY ["nuget.config", "."]
 RUN dotnet restore "AK.Order/AK.Order.API/AK.Order.API.csproj" --configfile nuget.config
 COPY . .
 WORKDIR "/src/AK.Order/AK.Order.API"
-RUN dotnet build "AK.Order.API.csproj" -c Release -o /app/build
-
-FROM build AS publish
 RUN dotnet publish "AK.Order.API.csproj" -c Release -o /app/publish /p:UseAppHost=false
 
-FROM base AS final
+FROM acrantkartdev.azurecr.io/antkart-base:9.0 AS final
 WORKDIR /app
-COPY --from=publish /app/publish .
-USER $APP_UID
+COPY --from=build /app/publish .
 ENTRYPOINT ["dotnet", "AK.Order.API.dll"]

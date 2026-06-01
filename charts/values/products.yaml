@@ -1,0 +1,82 @@
+# =============================================================================
+# AK.Products — Helm values
+# Status: ACTIVE (this is the service we deploy in Week 7)
+#
+# INSTALL:
+#   helm install ak-products charts/antkart-service \
+#     --namespace ak-products --create-namespace \
+#     -f charts/values/products.yaml \
+#     --set image.tag=<git-sha-or-date> \
+#     --set workloadIdentity.clientId=$(cd infrastructure/environments/dev/identity && terragrunt output -raw products_client_id)
+#
+# NOTE on the namespace:
+#   The namespace name MUST match products_k8s_namespace in the identity
+#   Terraform module (default: "ak-products"). The federated credential trusts
+#   "system:serviceaccount:ak-products:ak-products-sa" — changing either side
+#   without the other breaks Workload Identity silently.
+# =============================================================================
+
+nameOverride: ak-products
+
+image:
+  repository: acrantkartdev.azurecr.io/ak-products
+  # tag set at install: --set image.tag=<sha>
+
+containerPort: 8080
+service:
+  port: 80
+  targetPort: 8080
+
+# Workload Identity ENABLED — mi-ak-products-dev is federated by the identity module.
+workloadIdentity:
+  enabled: true
+  # clientId is supplied at install time via --set:
+  #   --set workloadIdentity.clientId=$(terragrunt output -raw products_client_id)
+  clientId: ""
+
+serviceAccount:
+  create: true
+  name: ak-products-sa     # MUST match products_k8s_service_account in identity module
+
+# Product service config. Non-secret values come from here; the Cosmos
+# connection string is fetched from Key Vault at startup using the Workload
+# Identity token (no secret env var).
+env:
+  - name: ASPNETCORE_ENVIRONMENT
+    value: Production
+
+  # Tells the seeder to run in Production environment (otherwise it skips).
+  # Safe because ProductSeeder.SeedAsync is idempotent (count>=300 → no-op).
+  - name: SEED_DATABASE
+    value: "true"
+
+  # Cosmos DB — non-secret references. The actual connection string is
+  # fetched from Key Vault at startup using the Workload Identity token.
+  - name: CosmosDb__KeyVaultUri
+    value: https://kv-antkart-dev.vault.azure.net/
+  - name: CosmosDb__SecretName
+    value: cosmos-connection-string
+  - name: MongoDbSettings__DatabaseName
+    value: antkart-products
+  - name: MongoDbSettings__ProductsCollection
+    value: products
+
+  # Azure Service Bus — namespace name only, no connection string. Auth is
+  # via DefaultAzureCredential → Workload Identity → mi-ak-products-dev.
+  - name: ServiceBus__FullyQualifiedNamespace
+    value: sb-antkart-dev.servicebus.windows.net
+
+  # Entra ID JWT validation. Set at install via --set if the values shouldn't
+  # be committed; placeholders kept here for clarity. Production would inject
+  # via env vars from a secure source.
+  - name: AzureAd__TenantId
+    value: 4cacc56a-0d38-46c4-ba20-429d51d7b449
+  # AzureAd__ClientId and AzureAd__Audience supplied via --set on install.
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

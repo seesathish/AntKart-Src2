@@ -1,6 +1,13 @@
-FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS base
-WORKDIR /app
-EXPOSE 8000
+# =============================================================================
+# AK.Gateway.API — Dockerfile
+# Inherits from acrantkartdev.azurecr.io/antkart-base:9.0 — see docker/base/Dockerfile.
+#
+# PORT OVERRIDE (the only service that does this):
+#   The Ocelot gateway is the single client-facing entry point and listens on
+#   port 8000, not the base image's 8080 default. We override ASPNETCORE_URLS
+#   here and re-declare EXPOSE. Helm values for ak-gateway must also set
+#   containerPort: 8000 and service.port: 8000 — see charts/values/gateway.yaml.
+# =============================================================================
 
 FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
 WORKDIR /src
@@ -10,13 +17,11 @@ COPY ["nuget.config", "."]
 RUN dotnet restore "AK.Gateway/AK.Gateway.API/AK.Gateway.API.csproj" --configfile nuget.config
 COPY . .
 WORKDIR "/src/AK.Gateway/AK.Gateway.API"
-RUN dotnet build "AK.Gateway.API.csproj" -c Release -o /app/build
-
-FROM build AS publish
 RUN dotnet publish "AK.Gateway.API.csproj" -c Release -o /app/publish /p:UseAppHost=false
 
-FROM base AS final
+FROM acrantkartdev.azurecr.io/antkart-base:9.0 AS final
 WORKDIR /app
-COPY --from=publish /app/publish .
-USER $APP_UID
+COPY --from=build /app/publish .
+ENV ASPNETCORE_URLS=http://+:8000
+EXPOSE 8000
 ENTRYPOINT ["dotnet", "AK.Gateway.API.dll"]

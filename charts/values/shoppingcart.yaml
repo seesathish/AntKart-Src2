@@ -1,0 +1,46 @@
+# =============================================================================
+# AK.ShoppingCart — Helm values
+# Status: NOT YET DEPLOYED — Redis-only dependency; no managed identity yet.
+#
+# ShoppingCart uses Redis (no Azure resource Workload Identity is needed for).
+# When deployed: either Azure Cache for Redis (managed identity AAD-auth) or
+# a Redis pod in-cluster. Until that decision, this file is a placeholder.
+# =============================================================================
+
+nameOverride: ak-shoppingcart
+
+image:
+  repository: acrantkartdev.azurecr.io/ak-shoppingcart
+
+containerPort: 8080
+service:
+  port: 80
+  targetPort: 8080
+
+workloadIdentity:
+  enabled: false           # ShoppingCart may not need WI if Redis is in-cluster
+  clientId: ""
+
+serviceAccount:
+  create: true
+  name: ak-shoppingcart-sa
+
+env:
+  - name: ASPNETCORE_ENVIRONMENT
+    value: Production
+
+  - name: RedisSettings__ConnectionString
+    value: "PLACEHOLDER-set-when-deployed (redis.ak-shoppingcart.svc.cluster.local:6379 or Azure Cache endpoint)"
+  - name: RedisSettings__InstanceName
+    value: "AKCart:"
+
+  - name: AzureAd__TenantId
+    value: 4cacc56a-0d38-46c4-ba20-429d51d7b449
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

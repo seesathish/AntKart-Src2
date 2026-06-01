@@ -1,0 +1,49 @@
+# =============================================================================
+# AK.Discount — Helm values
+# Status: NOT YET DEPLOYED — uses gRPC (HTTP/2), no Azure resource dependency.
+#
+# Discount is the only gRPC service in the fleet. The Helm chart still works
+# for it because the deployment is just a container exposing a port; the
+# protocol on top is opaque to Kubernetes Service / Deployment objects.
+#
+# Known issue: KI-001 (Keycloak realm_access.roles bug in AuthInterceptor).
+# Read RPCs are unaffected; admin write RPCs will return PermissionDenied
+# until the interceptor is rewritten. Tracked in KNOWN-ISSUES.md.
+# =============================================================================
+
+nameOverride: ak-discount
+
+image:
+  repository: acrantkartdev.azurecr.io/ak-discount
+
+containerPort: 8080
+service:
+  port: 80
+  targetPort: 8080
+
+workloadIdentity:
+  enabled: false           # Discount uses SQLite; no Azure resource access
+  clientId: ""
+
+serviceAccount:
+  create: true
+  name: ak-discount-sa
+
+env:
+  - name: ASPNETCORE_ENVIRONMENT
+    value: Production
+
+  # gRPC over HTTP/2. Kestrel needs Http2 protocols enabled.
+  - name: Kestrel__EndpointDefaults__Protocols
+    value: Http2
+
+  - name: AzureAd__TenantId
+    value: 4cacc56a-0d38-46c4-ba20-429d51d7b449
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

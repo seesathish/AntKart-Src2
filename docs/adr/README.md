@@ -40,3 +40,4 @@ These two ADRs document the architectural pillars that all subsequent decisions 
 | [ADR-012](ADR-012-messaging-migration-to-service-bus.md) | Messaging Migration to Azure Service Bus | Accepted |
 | [ADR-013](ADR-013-data-migration-cosmosdb-and-workload-identity.md) | Data Migration — Cosmos DB and Workload Identity | Accepted |
 | [ADR-014](ADR-014-entra-id-functions-eventgrid.md) | Microsoft Entra ID, Azure Functions Isolated Worker, and Event Grid | Accepted |
+| [ADR-015](ADR-015-aks-workload-identity-base-image.md) | AKS Cluster, Workload Identity, and Custom Hardened Base Image | Accepted |

@@ -1,6 +1,17 @@
-FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS base
-WORKDIR /app
-EXPOSE 8080
+# =============================================================================
+# AK.Discount.Grpc — Dockerfile
+# Inherits from acrantkartdev.azurecr.io/antkart-base:9.0 — see docker/base/Dockerfile.
+#
+# SQLite NOTE:
+#   The original Dockerfile created /app/data via `RUN mkdir -p /app/data && chown ...`
+#   to give the SQLite file a writable path. Chiseled images have no mkdir or
+#   chown binary — and they don't need them. Both runtime paths to a writable
+#   /app/data already work:
+#     - docker-compose: the named volume `discount_data:/app/data` is created and
+#       owned by the host's Docker daemon when the container starts.
+#     - AKS (Week 8+): a PersistentVolumeClaim mounted at /app/data does the same.
+#   So the mkdir/chown was redundant and is removed here.
+# =============================================================================
 
 FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
 WORKDIR /src
@@ -13,14 +24,9 @@ COPY ["nuget.config", "."]
 RUN dotnet restore "AK.Discount/AK.Discount.Grpc/AK.Discount.Grpc.csproj" --configfile nuget.config
 COPY . .
 WORKDIR "/src/AK.Discount/AK.Discount.Grpc"
-RUN dotnet build "AK.Discount.Grpc.csproj" -c Release -o /app/build
-
-FROM build AS publish
 RUN dotnet publish "AK.Discount.Grpc.csproj" -c Release -o /app/publish /p:UseAppHost=false
 
-FROM base AS final
+FROM acrantkartdev.azurecr.io/antkart-base:9.0 AS final
 WORKDIR /app
-COPY --from=publish /app/publish .
-RUN mkdir -p /app/data && chown -R $APP_UID:$APP_UID /app/data
-USER $APP_UID
+COPY --from=build /app/publish .
 ENTRYPOINT ["dotnet", "AK.Discount.Grpc.dll"]

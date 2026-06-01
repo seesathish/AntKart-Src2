@@ -1,0 +1,56 @@
+# =============================================================================
+# AK.Notification — Helm values
+# Status: NOT YET DEPLOYED — see order.yaml header for the federation prerequisite.
+# =============================================================================
+
+nameOverride: ak-notification
+
+image:
+  repository: acrantkartdev.azurecr.io/ak-notification
+
+containerPort: 8080
+service:
+  port: 80
+  targetPort: 8080
+
+workloadIdentity:
+  enabled: false           # PLACEHOLDER — flip after mi-ak-notification-dev federation
+  clientId: ""
+
+serviceAccount:
+  create: true
+  name: ak-notification-sa
+
+env:
+  - name: ASPNETCORE_ENVIRONMENT
+    value: Production
+
+  - name: ConnectionStrings__Postgres
+    value: "PLACEHOLDER-set-via-key-vault-or-aad-auth-when-deployed"
+
+  - name: ServiceBus__FullyQualifiedNamespace
+    value: sb-antkart-dev.servicebus.windows.net
+
+  # SMTP settings — sourced from Key Vault when deployed.
+  # Local dev uses Mailhog; production target is Gmail SMTP via app password.
+  - name: EmailSettings__From
+    value: noreply@antkart.com
+  - name: EmailSettings__DisplayName
+    value: AntKart
+  - name: EmailSettings__Host
+    value: "PLACEHOLDER-set-via-key-vault-when-deployed"
+  - name: EmailSettings__Port
+    value: "587"
+  - name: EmailSettings__EnableSsl
+    value: "true"
+
+  - name: AzureAd__TenantId
+    value: 4cacc56a-0d38-46c4-ba20-429d51d7b449
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi    # Notification can spike on MailKit + EF Core; consider 768Mi later.

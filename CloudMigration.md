@@ -865,13 +865,128 @@ All 620 tests pass.
 
 ---
 
+## Week 7 — AKS Cluster, Custom Base Image, Helm & First Deployments
+
+Phase 2C begins. Phase 2A (Weeks 3–5) provisioned Azure infrastructure. Phase 2B (Week 6) migrated authentication, added the Azure Function, and wired Event Grid. Phase 2C now moves the services **into** Kubernetes.
+
+### Goal
+
+- Provision an AKS cluster wired to existing networking, ACR, Log Analytics, and the existing Workload Identity foundation.
+- Replace each service's Microsoft-hosted base image with an organisation-owned chiseled base in ACR.
+- Federate the existing `mi-ak-products-dev` identity to the AKS OIDC issuer.
+- Build one reusable Helm chart serving all 8 services, with per-service values files.
+- Deploy AK.Products to AKS and prove Cosmos access works via Workload Identity — zero secrets.
+
+### Files added or modified
+
+#### Custom base image (NEW)
+
+- `docker/base/Dockerfile` — `FROM mcr.microsoft.com/dotnet/aspnet:9.0-noble-chiseled`. Sets `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=true`, `ASPNETCORE_URLS=http://+:8080`, non-root UID 1654, OCI labels. Published to `acrantkartdev.azurecr.io/antkart-base:9.0`.
+
+#### Service Dockerfiles (8 modified — same pattern)
+
+Each updated from a four-stage build with the Microsoft runtime to a two-stage build (`sdk` build → `antkart-base` final). The build stage stays on the standard SDK image (chiseled has no MSBuild). The final stage pulls `acrantkartdev.azurecr.io/antkart-base:9.0`.
+
+- `AK.Products/AK.Products.API/Dockerfile`
+- `AK.Order/AK.Order.API/Dockerfile`
+- `AK.Payments/AK.Payments.API/Dockerfile`
+- `AK.Notification/AK.Notification.API/Dockerfile`
+- `AK.ShoppingCart/AK.ShoppingCart.API/Dockerfile`
+- `AK.UserIdentity/AK.UserIdentity.API/Dockerfile`
+- `AK.Discount/AK.Discount.Grpc/Dockerfile` — removed the now-impossible `RUN mkdir -p /app/data && chown ...` line (chiseled has no `mkdir`/`chown`); SQLite data path is supplied at runtime by a Compose volume or future K8s PVC.
+- `AK.Gateway/AK.Gateway.API/Dockerfile` — overrides `ASPNETCORE_URLS` to port 8000 (Gateway's only deviation from the fleet).
+
+#### AKS Terraform module (NEW)
+
+- `infrastructure/modules/aks/main.tf` — `azurerm_kubernetes_cluster` with two node pools (system tainted `CriticalAddonsOnly=true:NoSchedule` + user), Azure CNI, OIDC issuer + Workload Identity flags, Container Insights wired to existing Log Analytics workspace, system-assigned cluster identity, `AcrPull` role assignment on the kubelet identity scoped to the ACR.
+- `infrastructure/modules/aks/variables.tf` — sizing variables (default `Standard_B2s` × 1–2 system × 1–3 user) with per-environment override comments.
+- `infrastructure/modules/aks/outputs.tf` — cluster name, RG, OIDC issuer URL (consumed by identity module), node RG (for cost analysis), sensitive kubeconfig.
+- `infrastructure/modules/aks/README.md` — module documentation.
+- `infrastructure/environments/dev/aks/terragrunt.hcl` — dev wiring reading RG, AKS subnet, ACR ID, and Log Analytics workspace ID from upstream module state.
+
+#### Identity module extension (Workload Identity federation)
+
+- `infrastructure/modules/identity/variables.tf` — three new variables: `aks_oidc_issuer_url` (null-default, gates federation), `products_k8s_namespace` (default `ak-products`), `products_k8s_service_account` (default `ak-products-sa`).
+- `infrastructure/modules/identity/main.tf` — added `azurerm_federated_identity_credential.products` with `count = aks_oidc_issuer_url != null ? 1 : 0`. Two-pass apply pattern: Week 5 had URL=null and skipped creation; Week 7 re-applies with the URL piped through.
+- `infrastructure/environments/dev/identity/terragrunt.hcl` — new `dependency "aks"` block + inputs for federation. The dependency uses `mock_outputs` with `oidc_issuer_url = null` so the module can still plan/apply standalone if AKS doesn't exist yet.
+
+#### Helm chart (NEW)
+
+- `charts/antkart-service/Chart.yaml` — chart v0.1.0, appVersion 9.0.
+- `charts/antkart-service/values.yaml` — default values for the chart: replica count, ports, security context (runAsNonRoot=true, runAsUser=1654, readOnlyRootFilesystem=true, drop ALL capabilities), liveness + readiness probes on `/health`, resource requests/limits, Workload Identity off by default.
+- `charts/antkart-service/templates/_helpers.tpl` — naming + labelling helpers.
+- `charts/antkart-service/templates/deployment.yaml` — pod template with `azure.workload.identity/use: "true"` label rendered conditionally, `/tmp` emptyDir volume (because readOnlyRootFilesystem), named ports.
+- `charts/antkart-service/templates/service.yaml` — ClusterIP Service using named port `http`.
+- `charts/antkart-service/templates/serviceaccount.yaml` — ServiceAccount with `azure.workload.identity/client-id` annotation rendered conditionally.
+- `charts/antkart-service/templates/hpa.yaml` — optional, off by default.
+- `charts/antkart-service/templates/NOTES.txt` — post-install cheat sheet.
+- `charts/antkart-service/README.md` — chart documentation.
+
+#### Per-service Helm values (8 NEW)
+
+One values file per service. Products is active (`workloadIdentity.enabled: true`); the other 7 have explicit placeholders with `workloadIdentity.enabled: false` and clear "not yet deployed" headers. This proves the chart template generalizes across the fleet without risking accidental broken deployments.
+
+- `charts/values/products.yaml` — **ACTIVE**. Cosmos via Key Vault, Service Bus via WI, Entra audience for JWT validation.
+- `charts/values/order.yaml` — placeholder
+- `charts/values/payments.yaml` — placeholder
+- `charts/values/notification.yaml` — placeholder
+- `charts/values/shoppingcart.yaml` — placeholder
+- `charts/values/useridentity.yaml` — placeholder (uses ClientSecret-based auth, not WI)
+- `charts/values/gateway.yaml` — placeholder (port 8000 override, future LoadBalancer)
+- `charts/values/discount.yaml` — placeholder (gRPC; KI-001 still applies)
+
+#### Documentation
+
+- `docs/adr/ADR-015-aks-workload-identity-base-image.md` — three decisions: AKS cluster shape, Workload Identity federation, chiseled custom base image. Alternatives considered with explicit reasoning.
+- `DevelopmentGuide.md` Section 7 — deep walkthrough of the AKS concepts, the Workload Identity chain, the deploy commands, the no-secret verification, and the destroy-when-idle pattern.
+- `CloudMigration.md` — this entry.
+- `README.md` — Project Docs table updated to reference the AKS module and Helm chart; ADR index updated with ADR-015.
+
+### Why these changes
+
+- **Custom base in ACR (not direct pull from `mcr.microsoft.com`)** — supply-chain control, faster AKS pulls, single hardening surface, target for Week 11 admission policy.
+- **Chiseled runtime** — minimal attack surface (no shell, apt, coreutils), smaller image (~115 MB vs ~220 MB), enforced non-root. Trade-off: `kubectl exec -- sh` is gone; we use `kubectl debug` ephemeral containers instead.
+- **Two-node-pool design with system pool taint** — clean separation of kube-system from app workloads, independent scaling, future spot-VM eligibility on the user pool.
+- **Azure CNI** — pods get real VNet IPs, can reach Cosmos and Service Bus via private endpoints directly, NSGs apply to pod traffic. Trade-off accepted: subnet IPs consumed per pod (/22 = ~1019 IPs covers dev growth).
+- **AKS Free SKU tier in dev** — saves $73/month vs Standard. No SLA, no production use case for an SLA on a learning cluster. Standard is the prod choice.
+- **Workload Identity, Products only this week** — matches what we actually deploy. Pre-creating 7 unused identities adds Azure objects with no benefit. The pattern in `identity/main.tf` is documented for incremental Week 8–9 extension.
+- **All 8 Dockerfiles updated to the custom base, even though only Products deploys this week** — consistency now avoids drift later. The values files for the other 7 are placeholder-marked and cannot accidentally deploy a broken pod (WI disabled + placeholder env vars → safe failure).
+
+### Verification
+
+- `dotnet build` — must still succeed for all 8 services. Dockerfile changes are runtime-only.
+- `dotnet test` — must still pass 621 tests. No application code changed.
+- `terragrunt validate` in each new module — must pass.
+- `helm lint charts/antkart-service -f charts/values/products.yaml` — must pass.
+- `helm template ak-products charts/antkart-service -f charts/values/products.yaml --set image.tag=test --set workloadIdentity.clientId=00000000-0000-0000-0000-000000000000` — must render valid YAML for all four templates.
+
+After Phase 2 (paid steps):
+- `kubectl get nodes` returns 2 nodes.
+- `kubectl describe node` shows `CriticalAddonsOnly=true:NoSchedule` on the system pool.
+- `kubectl get pods -n ak-products` shows Running, Ready 1/1 for ak-products.
+- `kubectl logs` shows the Key Vault secret fetch line and a successful Cosmos connection — no credential errors.
+- `curl http://localhost:8080/api/v1/products/categories` (via port-forward) returns `["Men","Women","Kids"]`.
+
+### Cost impact
+
+| State | Monthly |
+|-------|---------|
+| Pre-Week 7 (no AKS) | ~$15–20 |
+| Week 7 running 24/7 | **~$105–115** |
+| Week 7 with AKS destroyed when idle | ~$15–20 |
+
+The destroy-when-idle pattern (DevelopmentGuide §7.10) is the prescribed cost control for dev. `terragrunt destroy` in the aks module folder; recreate with `apply` (10–15 min).
+
+---
+
 ## Future Weeks (planned)
 
 | Week | Change |
 |------|--------|
-| 7 | AKS cluster provisioning, ingress controller, Workload Identity federation (linking Week 5 identities to AKS pods) |
-| 8 | Deploy services to AKS: Dockerfiles, Helm charts, image push to ACR |
-| 9 | Observability: Application Insights SDK integration, distributed tracing |
-| 10 | Auto-scaling, resource limits, production hardening |
+| 8 | Federate remaining services' Workload Identity (Order, Payments, Notification), deploy them to AKS; ingress controller (NGINX or AGIC) for external Gateway exposure |
+| 9 | Observability: Application Insights SDK integration in app code, distributed tracing across services |
+| 10 | Auto-scaling tuning (HPA + cluster autoscaler), resource right-sizing under load |
+| 11 | Trivy scanning of antkart-base, cosign signing, AKS admission policy gating on signed digest |
+| 12-13 | Load testing — temporarily scale to larger node SKU, run synthetic traffic, validate autoscaler behaviour |
 
 Each week's changes will be documented here with the same format: file, what changed, why it changed.

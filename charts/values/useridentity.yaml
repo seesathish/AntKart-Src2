@@ -1,0 +1,52 @@
+# =============================================================================
+# AK.UserIdentity — Helm values
+# Status: NOT YET DEPLOYED — uses Entra ID client credentials (ClientSecret),
+# not Workload Identity. May not need WI at all for its Graph API calls.
+# =============================================================================
+
+nameOverride: ak-useridentity
+
+image:
+  repository: acrantkartdev.azurecr.io/ak-useridentity
+
+containerPort: 8080
+service:
+  port: 80
+  targetPort: 8080
+
+workloadIdentity:
+  enabled: false           # UserIdentity uses ClientSecret-based Graph auth currently
+  clientId: ""
+
+serviceAccount:
+  create: true
+  name: ak-useridentity-sa
+
+env:
+  - name: ASPNETCORE_ENVIRONMENT
+    value: Production
+
+  # All EntraId:* values are placeholders — sourced from Key Vault when deployed.
+  - name: AzureAd__TenantId
+    value: 4cacc56a-0d38-46c4-ba20-429d51d7b449
+
+  - name: EntraId__TenantId
+    value: 4cacc56a-0d38-46c4-ba20-429d51d7b449
+  - name: EntraId__ClientId
+    value: "PLACEHOLDER-set-via-key-vault-when-deployed"
+  - name: EntraId__ClientSecret
+    value: "PLACEHOLDER-set-via-key-vault-when-deployed"
+  - name: EntraId__TenantDomain
+    value: "PLACEHOLDER-set-via-key-vault-when-deployed"
+  - name: EntraId__ApiObjectId
+    value: "PLACEHOLDER-set-via-key-vault-when-deployed"
+  - name: EntraId__UserRoleId
+    value: "PLACEHOLDER-set-via-key-vault-when-deployed"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

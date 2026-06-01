@@ -1,0 +1,227 @@
+# =============================================================================
+# antkart-service — DEFAULT VALUES
+# File: charts/antkart-service/values.yaml
+#
+# These are the chart's sensible defaults. Each per-service file in
+# charts/values/<service>.yaml overrides the bits that differ. Anything not
+# overridden inherits from here.
+#
+# A SERVICE'S per-service file is the minimal delta needed for that service:
+#     name, image.repository, port, env vars, Workload Identity client ID.
+#   Everything else (probes, resources, security context, replica count) is
+#   the same across the fleet and stays here.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Identity of THIS deployment.
+#
+# nameOverride lets you call `helm install ak-products …` while the chart
+# template still tags Kubernetes objects with "ak-products-…" labels via the
+# helper in templates/_helpers.tpl.
+# -----------------------------------------------------------------------------
+nameOverride: ""
+fullnameOverride: ""
+
+# -----------------------------------------------------------------------------
+# IMAGE — what container to run.
+#
+# repository: ACR-qualified image name (no tag).
+# tag:        the image tag. Each per-service values file commonly leaves
+#             this empty and the install pipeline passes --set image.tag=$SHA.
+#             The chart falls back to Chart.appVersion if tag is empty.
+# pullPolicy: IfNotPresent is fine in AKS because kubelet's identity has
+#             AcrPull and ACR images are immutable per-tag in practice.
+# -----------------------------------------------------------------------------
+image:
+  repository: ""        # OVERRIDE per service (e.g. acrantkartdev.azurecr.io/ak-products)
+  tag: ""               # OVERRIDE per install (--set image.tag=<sha>)
+  pullPolicy: IfNotPresent
+
+# -----------------------------------------------------------------------------
+# REPLICA COUNT
+#
+# Dev default: 1 replica. HPA can override this on the fly when enabled.
+# Production would set 2+ for HA across nodes (with HPA on top).
+# -----------------------------------------------------------------------------
+replicaCount: 1
+
+# -----------------------------------------------------------------------------
+# CONTAINER PORT
+#
+# All services except Gateway listen on 8080 (matching the antkart-base
+# image's EXPOSE 8080 and ASPNETCORE_URLS default). Gateway listens on 8000 —
+# its values file overrides this.
+# -----------------------------------------------------------------------------
+containerPort: 8080
+
+# -----------------------------------------------------------------------------
+# SERVICE (ClusterIP)
+#
+# Within the cluster, other services and the Gateway reach this pod via
+# http://<svc-name>.<namespace>.svc.cluster.local:<service.port>
+#
+# We use ClusterIP for everything — Gateway will be the only LoadBalancer when
+# we expose it externally in a later week. For local development access during
+# Week 7, we use `kubectl port-forward svc/<name> 8080:80`.
+# -----------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 80              # Service-side port. Most services hit each other on port 80.
+  targetPort: 8080      # Maps to the container's listening port.
+
+# -----------------------------------------------------------------------------
+# WORKLOAD IDENTITY
+#
+# enabled = true:
+#   The pod template gets the `azure.workload.identity/use: "true"` label
+#   AND the ServiceAccount gets the `azure.workload.identity/client-id`
+#   annotation. AKS's webhook then projects the federation token into the
+#   pod. DefaultAzureCredential picks it up and authenticates as the managed
+#   identity. No secrets, no env vars, no Kubernetes Secret.
+#
+# enabled = false (the 7 services we're NOT deploying this week):
+#   Per-service values files set this to false. The chart still renders a
+#   ServiceAccount (Kubernetes requires one) — but without Workload Identity
+#   annotations. If you accidentally `helm install` one of those services
+#   without first creating its managed identity + federation, the pod will
+#   come up but any DefaultAzureCredential call will fail to authenticate.
+#   This is the safe failure mode the user asked for in Week 7 decision #1.
+#
+# clientId:
+#   Set ONLY when enabled=true. This is the Entra Object's client ID of the
+#   federated managed identity (e.g. mi-ak-products-dev). Grab it from
+#   `terragrunt output --raw products_client_id` in the identity module.
+# -----------------------------------------------------------------------------
+workloadIdentity:
+  enabled: false        # OVERRIDE per service when its identity is federated
+  clientId: ""          # OVERRIDE when enabled=true
+
+# -----------------------------------------------------------------------------
+# SERVICE ACCOUNT
+#
+# Created automatically. The name defaults to <release>-sa (e.g. ak-products-sa).
+# That name MUST MATCH the `subject` of the federated_identity_credential in
+# the identity Terraform module — change one without the other and federation
+# breaks silently with "AADSTS70021: No matching federated identity record found".
+# -----------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  name: ""              # OVERRIDE if you need a specific SA name; otherwise computed
+
+# -----------------------------------------------------------------------------
+# RESOURCES — requests/limits for the pod
+#
+# requests: minimum the kube scheduler reserves. Pod won't be scheduled if no
+#           node has this much available.
+# limits:   hard cap. CPU above limit gets throttled; memory above limit gets
+#           OOMKilled.
+#
+# Dev sizing: 100m CPU + 256Mi memory request is enough for a stateless .NET 9
+# service handling moderate traffic. Limits at 4× provide burst headroom.
+# Adjust per-service if a service is heavier (Notification's MailKit + EF Core
+# may need 512Mi limit).
+# -----------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# -----------------------------------------------------------------------------
+# LIVENESS / READINESS probes
+#
+# /health is the BuildingBlocks default health endpoint registered by every
+# service via AddDefaultHealthChecks() + MapDefaultHealthChecks() in Program.cs.
+#
+# WHY TWO PROBES (not one)?
+#   - readinessProbe: "Can this pod serve traffic NOW?" — if it fails, the
+#     pod is removed from the Service's endpoints but is NOT restarted.
+#     Used to gate traffic during startup, database reconnects, or planned
+#     drains.
+#   - livenessProbe: "Is this pod fundamentally broken?" — if it fails,
+#     kubelet kills and restarts the pod. Use sparingly; aggressive liveness
+#     probes turn flaky dependencies into restart loops.
+#
+# Startup-delay sized for .NET 9 cold start (Cosmos key vault fetch, MongoDB
+# index creation, MassTransit topology setup): 20-30s buffer before the
+# first liveness check fires.
+# -----------------------------------------------------------------------------
+probes:
+  liveness:
+    path: /health
+    initialDelaySeconds: 30
+    periodSeconds: 20
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    path: /health
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# -----------------------------------------------------------------------------
+# POD SECURITY CONTEXT
+#
+# runAsNonRoot=true: kubelet REFUSES to start the pod if the image's USER is
+# root (UID 0). antkart-base sets USER 1654 — this enforces the contract.
+# runAsUser=1654: explicit redundancy with the Dockerfile, defends against an
+# image base swap that accidentally drops to root.
+# allowPrivilegeEscalation=false + readOnlyRootFilesystem=true: defence in depth.
+# .NET writes only to /tmp and /app (we set /tmp emptyDir below).
+# capabilities.drop=ALL: pod can't even ping. Web apps don't need raw sockets.
+# -----------------------------------------------------------------------------
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1654
+  fsGroup: 1654
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# -----------------------------------------------------------------------------
+# ENVIRONMENT VARIABLES
+#
+# Two ways to provide env vars:
+#   env:        literal name/value pairs in the values file (this list)
+#   envFromConfigMap: a single ConfigMap key→env mapping
+#
+# Per-service values files populate `env` with their specific config:
+#   ASPNETCORE_ENVIRONMENT, AzureAd__ClientId, AzureAd__Audience, etc.
+# -----------------------------------------------------------------------------
+env: []
+# - name: ASPNETCORE_ENVIRONMENT
+#   value: Production
+# - name: AzureAd__ClientId
+#   value: "<set per service>"
+
+# -----------------------------------------------------------------------------
+# HORIZONTAL POD AUTOSCALER (HPA)
+#
+# Disabled by default — Week 7 deploys with replicaCount: 1 to keep the
+# B2s node pool happy. Enable per-service later when there's a need.
+# When enabled, replicaCount becomes the HPA's minReplicas.
+# -----------------------------------------------------------------------------
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 70
+
+# -----------------------------------------------------------------------------
+# SCHEDULING
+#
+# nodeSelector / tolerations: empty by default. The system pool is tainted
+# `CriticalAddonsOnly=true:NoSchedule` so app pods naturally land on the user
+# pool without any explicit nodeSelector — the absence of a toleration for
+# that taint is what excludes them. No action needed here.
+# -----------------------------------------------------------------------------
+nodeSelector: {}
+tolerations: []
+affinity: {}

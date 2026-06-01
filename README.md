@@ -470,8 +470,71 @@ dotnet test
 
 | Document | Purpose |
 |----------|---------|
+| [DevelopmentGuide.md](DevelopmentGuide.md) | Step-by-step guide to provisioning, migrating, and deploying AntKart — Sections 1–7 cover Phase 1 application, Phase 2A infra, Phase 2B Functions+Entra, Phase 2C AKS+Helm |
+| [CloudMigration.md](CloudMigration.md) | Per-week migration log: what files changed and why, Week 3 onwards |
 | [KNOWN-ISSUES.md](KNOWN-ISSUES.md) | Deliberately-deferred bugs and tech debt — tracked, owned, and scheduled for a future fix phase |
 | [EVENTBUS.md](EVENTBUS.md) | Event bus and SAGA design |
 | [RESILIENCE.md](RESILIENCE.md) | Polly circuit breaker design |
 | [OBSERVABILITY.md](OBSERVABILITY.md) | ELK observability design |
-| [docs/adr/README.md](docs/adr/README.md) | Architecture Decision Records index (ADR-F1, ADR-F2, ADR-001 through ADR-014) |
+| [docs/adr/README.md](docs/adr/README.md) | Architecture Decision Records index (ADR-F1, ADR-F2, ADR-001 through ADR-015) |
+| [charts/antkart-service/README.md](charts/antkart-service/README.md) | Reusable Helm chart for deploying any AntKart service to AKS |
+| [infrastructure/modules/aks/README.md](infrastructure/modules/aks/README.md) | AKS Terraform module — node pools, Azure CNI, Workload Identity, cost estimate |
+
+## Cloud Deployment (Phase 2C — Week 7)
+
+AntKart services now deploy to **Azure Kubernetes Service** with Workload Identity for secret-less auth. The full deployment model:
+
+```
+Developer / CI ─▶ az acr build ─▶ acrantkartdev.azurecr.io/<service>:<tag>
+                                          │
+                                          ▼
+                                  AKS kubelet pulls image
+                                          │
+                                          ▼
+                          ┌──────────────────────────────┐
+                          │ Pod (chiseled, non-root,     │
+                          │      uid 1654, readonly FS)  │
+                          │                              │
+                          │ DefaultAzureCredential       │
+                          │  → WorkloadIdentityCredential│
+                          │  → projected SA JWT          │
+                          └────────────┬─────────────────┘
+                                       │
+                                       ▼
+                         Entra ID validates JWT against
+                         AKS OIDC issuer + federated cred
+                                       │
+                                       ▼
+                       Access token issued for managed identity
+                                       │
+                                       ▼
+                  ┌────────────────┬─────────────────┬──────────────┐
+                  ▼                ▼                 ▼              ▼
+              Key Vault        Service Bus       Cosmos DB       (others)
+              (secrets)        (messaging)       (catalogue)
+```
+
+**Quick deploy (after `terragrunt apply` on AKS):**
+
+```powershell
+# Build base image and Products service image
+az acr build --registry acrantkartdev --image antkart-base:9.0 --file docker/base/Dockerfile docker/base
+az acr build --registry acrantkartdev --image "ak-products:$(git rev-parse --short HEAD)" --file AK.Products/AK.Products.API/Dockerfile .
+
+# Get AKS credentials and Workload Identity client ID
+az aks get-credentials --resource-group rg-antkart-dev-eastus --name aks-antkart-dev --overwrite-existing
+$WI_CLIENT_ID = cd infrastructure/environments/dev/identity ; terragrunt output -raw products_client_id ; cd ../../../..
+
+# Helm install
+helm install ak-products charts/antkart-service `
+    --namespace ak-products --create-namespace `
+    -f charts/values/products.yaml `
+    --set image.tag=$(git rev-parse --short HEAD) `
+    --set workloadIdentity.clientId=$WI_CLIENT_ID
+
+# Verify
+kubectl port-forward -n ak-products svc/ak-products 8080:80
+curl http://localhost:8080/api/v1/products/categories
+```
+
+Full walkthrough: [DevelopmentGuide.md §7](DevelopmentGuide.md). Cost control (destroy AKS when idle): [DevelopmentGuide.md §7.10](DevelopmentGuide.md).
