@@ -78,7 +78,9 @@ resource "azurerm_kubernetes_cluster" "this" {
   sku_tier = "Free"
 
   # Pin patch-level auto-upgrades. Minor upgrades remain manual.
-  automatic_channel_upgrade = "patch"
+  # NOTE: this argument was renamed `automatic_channel_upgrade` → `automatic_upgrade_channel`
+  # in AzureRM 4.x. We're on 4.x via root.hcl's `~> 4.0` constraint.
+  automatic_upgrade_channel = "patch"
 
   # The two Workload Identity prerequisites. See block comment above.
   oidc_issuer_enabled       = true
@@ -120,7 +122,8 @@ resource "azurerm_kubernetes_cluster" "this" {
     orchestrator_version = var.kubernetes_version
 
     # Autoscaler bounds.
-    enable_auto_scaling = true
+    # NOTE: renamed `enable_auto_scaling` → `auto_scaling_enabled` in AzureRM 4.x.
+    auto_scaling_enabled = true
     min_count           = var.system_node_min_count
     max_count           = var.system_node_max_count
 
@@ -251,9 +254,10 @@ resource "azurerm_kubernetes_cluster_node_pool" "user" {
   vm_size              = var.user_node_vm_size
   orchestrator_version = var.kubernetes_version
 
-  enable_auto_scaling = true
-  min_count           = var.user_node_min_count
-  max_count           = var.user_node_max_count
+  # NOTE: renamed `enable_auto_scaling` → `auto_scaling_enabled` in AzureRM 4.x.
+  auto_scaling_enabled = true
+  min_count            = var.user_node_min_count
+  max_count            = var.user_node_max_count
 
   vnet_subnet_id  = var.vnet_subnet_id
   os_disk_size_gb = 30

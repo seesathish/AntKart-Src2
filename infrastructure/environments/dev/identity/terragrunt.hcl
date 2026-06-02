@@ -123,7 +123,21 @@ dependency "aks" {
     node_resource_group        = "MC_mock-rg_mock-aks-antkart-dev_eastus"
     kubelet_identity_object_id = "00000000-0000-0000-0000-000000000000"
   }
-  mock_outputs_allowed_terraform_commands = ["validate", "plan"]
+
+  # WHY THIS LIST IS BROAD:
+  #   When AKS is not yet applied (the Week 5 / Week 7-Phase-1 state), this
+  #   dependency has no real outputs to read. We allow the mock_outputs to
+  #   satisfy read-only and lifecycle commands so that `terragrunt output`,
+  #   `terragrunt show`, `terragrunt init`, `terragrunt plan`, `terragrunt
+  #   validate`, and `terragrunt destroy` all work without AKS existing.
+  #
+  #   "apply" is deliberately EXCLUDED. If you `terragrunt apply` with the
+  #   AKS mock active, the federation resource would skip creation silently
+  #   (the mock sets oidc_issuer_url=null and the resource is `count = url
+  #   != null ? 1 : 0`). That matches the Week 5 state but might surprise
+  #   you if you intended to create the federation. Requiring real AKS
+  #   state for apply makes the failure mode loud, not silent.
+  mock_outputs_allowed_terraform_commands = ["validate", "plan", "init", "output", "show", "destroy", "refresh"]
 }
 
 inputs = {
