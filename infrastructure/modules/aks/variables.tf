@@ -71,9 +71,29 @@ variable "kubernetes_version" {
 # DEV defaults below match ADR-015. Production overrides via terragrunt inputs.
 # -----------------------------------------------------------------------------
 variable "system_node_vm_size" {
-  description = "VM SKU for the system node pool. Dev: Standard_B2s (burstable, ~$31/mo/node). Prod recommendation: Standard_D4s_v5 or larger for predictable performance."
-  type        = string
-  default     = "Standard_B2s"
+  description = <<-EOT
+    VM SKU for the system node pool.
+
+    Dev default: Standard_D2ds_v4 (~$70/mo/node, x86, 2 vCPU, 8 GB RAM,
+    75 GiB local NVMe temp disk — supports our 30 GB ephemeral OS disk).
+
+    HISTORICAL NOTE: The original ADR-015 choice was Standard_B2s (~$31/mo,
+    burstable). The Azure subscription used for AntKart blocks Standard_B2s
+    in eastus via tenant policy — only D-series, Bsv2-ARM64, and a few
+    others are allowed. First substitution Standard_D2s_v4 failed because
+    the Dsv4 family has NO local temp disk (Microsoft split Dv4 into
+    Dsv4 = no-temp = cheaper-at-scale, and Ddsv4 = with-temp = supports
+    ephemeral OS). The extra 'd' in Ddsv4 = "with local disk".
+    Standard_D2ds_v4 is the right choice: same price as D2s_v4, with 75 GiB
+    NVMe that supports ephemeral OS at our 30 GB size.
+
+    ARM64 (Standard_b2ps_v2 ~$28) would have kept the burstable cost
+    profile but required multi-arch image builds — deferred.
+
+    Prod recommendation: Standard_D4s_v5 or larger for predictable performance.
+  EOT
+  type    = string
+  default = "Standard_D2ds_v4"
 }
 
 variable "system_node_min_count" {
@@ -92,9 +112,20 @@ variable "system_node_max_count" {
 # User node pool sizing
 # -----------------------------------------------------------------------------
 variable "user_node_vm_size" {
-  description = "VM SKU for app workloads. Dev: Standard_B2s (burstable, ~$31/mo/node). Burst credits are fine for stateless web services; the destroy-when-idle pattern (DevelopmentGuide §7.10) makes credit exhaustion a non-issue. Prod: Standard_D4s_v5 or larger."
-  type        = string
-  default     = "Standard_B2s"
+  description = <<-EOT
+    VM SKU for app workloads.
+
+    Dev default: Standard_D2s_v4 (~$70/mo/node, x86, 2 vCPU, 8 GB RAM).
+
+    See the HISTORICAL NOTE on system_node_vm_size — the subscription policy
+    blocks Standard_B2s in eastus, so the original burstable choice isn't
+    available. D2s_v4 is the closest viable substitute that keeps amd64
+    images working without rebuilds.
+
+    Prod recommendation: Standard_D4s_v5 or larger.
+  EOT
+  type    = string
+  default = "Standard_D2ds_v4"
 }
 
 variable "user_node_min_count" {

@@ -108,8 +108,14 @@ dependency "acr" {
 dependency "log_analytics" {
   config_path = "../log-analytics"
 
+  # NOTE: the log-analytics module exposes TWO outputs that look similar:
+  #   - id            = full ARM resource ID /subscriptions/.../workspaces/<name>
+  #   - workspace_id  = GUID only (used by query APIs)
+  # AKS Container Insights needs `id` — passing the GUID fails plan time with
+  # "parsing the Workspace ID: the number of segments didn't match".
   mock_outputs = {
-    workspace_id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/mock-rg/providers/Microsoft.OperationalInsights/workspaces/mock-la"
+    id           = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/mock-rg/providers/Microsoft.OperationalInsights/workspaces/mock-la"
+    workspace_id = "00000000-0000-0000-0000-000000000000"
     name         = "mock-la"
   }
   mock_outputs_allowed_terraform_commands = ["validate", "plan"]
@@ -132,9 +138,12 @@ inputs = {
   location            = include.env.locals.location
   resource_group_name = dependency.resource_group.outputs.name
 
-  vnet_subnet_id             = dependency.networking.outputs.aks_subnet_id
-  acr_id                     = dependency.acr.outputs.id
-  log_analytics_workspace_id = dependency.log_analytics.outputs.workspace_id
+  vnet_subnet_id = dependency.networking.outputs.aks_subnet_id
+  acr_id         = dependency.acr.outputs.id
+
+  # Use `.id` (full ARM resource ID), not `.workspace_id` (just the GUID).
+  # AKS Container Insights needs the ARM ID; the GUID is for query APIs.
+  log_analytics_workspace_id = dependency.log_analytics.outputs.id
 
   # All sizing falls back to module defaults (B2s, 1-2 system, 1-3 user).
   # Override here if dev needs more capacity for the Week 12-13 load test.

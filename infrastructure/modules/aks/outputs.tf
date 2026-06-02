@@ -57,19 +57,26 @@ output "kubelet_identity_object_id" {
   value       = azurerm_kubernetes_cluster.this.kubelet_identity[0].object_id
 }
 
-output "kube_admin_config_raw" {
+output "kube_config_raw" {
   description = <<-EOT
-    Admin kubeconfig blob. SENSITIVE — contains cluster admin credentials.
+    Kubeconfig blob. SENSITIVE — contains cluster credentials.
     Normally you authenticate with `az aks get-credentials` which uses your
     user identity; this output is here for automation that needs a kubeconfig
     file directly. Don't print, log, or commit this value.
+
+    Why this is `kube_config_raw` and not `kube_admin_config_raw`:
+      kube_admin_config* is only populated when AAD-managed admin RBAC is
+      enabled (azure_active_directory_role_based_access_control block).
+      We don't enable that, so the kube_admin_config list is empty and
+      [0] indexing would fail. With local accounts (our config), kube_config
+      and kube_config_raw are the right outputs.
   EOT
-  value     = azurerm_kubernetes_cluster.this.kube_admin_config_raw
+  value     = azurerm_kubernetes_cluster.this.kube_config_raw
   sensitive = true
 }
 
 output "host" {
-  description = "API server URL. Useful for CI/CD pipelines that need to call kubectl with a separate auth method."
-  value       = azurerm_kubernetes_cluster.this.kube_admin_config[0].host
+  description = "API server URL. Useful for CI/CD pipelines that need to call kubectl with a separate auth method. Uses kube_config (not kube_admin_config) — see kube_config_raw output above for why."
+  value       = azurerm_kubernetes_cluster.this.kube_config[0].host
   sensitive   = true
 }
